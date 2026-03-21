@@ -1,0 +1,36 @@
+services:
+  vault:
+    build:
+      context: .
+      target: vault
+    entrypoint: /docker/vault-entrypoint.sh
+    ports:
+      - "8200:8200"
+    environment:
+      - HONEYCOMB_KEY_ID
+      - HONEYCOMB_KEY_SECRET
+      - HONEYCOMB_ENVIRONMENT
+      - VAULT_ADDR=http://127.0.0.1:8200
+      - VAULT_TOKEN=root
+    volumes:
+      - ./docker/vault-entrypoint.sh:/docker/vault-entrypoint.sh:ro
+    cap_add:
+      - IPC_LOCK
+
+  openbao:
+    build:
+      context: .
+      target: openbao
+    entrypoint: /docker/openbao-entrypoint.sh
+    ports:
+      - "8210:8200"
+    environment:
+      - HONEYCOMB_KEY_ID
+      - HONEYCOMB_KEY_SECRET
+      - HONEYCOMB_ENVIRONMENT
+      - BAO_ADDR=http://127.0.0.1:8200
+      - BAO_TOKEN=root
+    volumes:
+      - ./docker/openbao-entrypoint.sh:/docker/openbao-entrypoint.sh:ro
+    cap_add:
+      - IPC_LOCK
