@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Bug Fixes
 
 - handle pagination in ListEnvironments (#4)
+- add "rel:" prefix for release preparation PRs (#9)
 
 ### Improvements
 
