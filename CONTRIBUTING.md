@@ -41,6 +41,7 @@ Agents see [AGENTS.md](AGENTS.md) for detailed code conventions and project guid
   - `fix:` — bug fixes
   - `refactor:` / `perf:` / `chore:` / `docs:` / `ci:` / `test:` — improvements
   - `deps:` — dependency updates
+  - `rel:` — release preparation (excluded from changelog)
   - Append `!` for breaking changes (e.g., `feat!:`)
 - **All CI checks must pass** before merging: build, lint, test, acceptance, and PR title validation
 - **Keep changes focused** — one concern per PR
