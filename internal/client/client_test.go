@@ -346,6 +346,42 @@ func TestClient_ListEnvironments(t *testing.T) {
 	assert.Equal(t, "staging", envs[1].Slug)
 }
 
+func TestClient_ListEnvironments_Pagination(t *testing.T) {
+	ctx := context.Background()
+	page := 0
+	c, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		page++
+		w.Header().Set("Content-Type", jsonapi.MediaType)
+		w.WriteHeader(http.StatusOK)
+
+		if page == 1 {
+			_, _ = w.Write([]byte(`{
+				"data": [
+					{"id": "env1", "type": "environments", "attributes": {"name": "Production", "slug": "production"}},
+					{"id": "env2", "type": "environments", "attributes": {"name": "Staging", "slug": "staging"}}
+				],
+				"links": {"next": "/2/teams/my-team/environments?page[after]=env2&page[size]=2"}
+			}`))
+		} else {
+			_, _ = w.Write([]byte(`{
+				"data": [
+					{"id": "env3", "type": "environments", "attributes": {"name": "Development", "slug": "development"}}
+				],
+				"links": {"next": null}
+			}`))
+		}
+	})
+
+	envs, err := c.ListEnvironments(ctx)
+	require.NoError(t, err)
+	require.Len(t, envs, 3)
+
+	assert.Equal(t, "env1", envs[0].ID)
+	assert.Equal(t, "env2", envs[1].ID)
+	assert.Equal(t, "env3", envs[2].ID)
+	assert.Equal(t, 2, page, "should have made 2 requests")
+}
+
 func TestClient_CreateAPIKey(t *testing.T) {
 	ctx := context.Background()
 	c, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
