@@ -1028,6 +1028,96 @@ func TestEnvCacheMiss(t *testing.T) {
 	assert.Contains(t, err.Error(), "not found")
 }
 
+func TestEnvCacheMissRefreshesOnNewEnvironment(t *testing.T) {
+	ctx := context.Background()
+
+	envListCalls := 0
+	hasNewEnv := false
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/2/auth":
+			w.Header().Set("Content-Type", jsonapi.MediaType)
+			json.NewEncoder(w).Encode(map[string]any{
+				"data": map[string]any{
+					"id": "hcxmk_testkey", "type": "api-keys",
+					"attributes": map[string]any{
+						"name": "test key", "key_type": "management",
+						"disabled": false, "scopes": []string{"api-keys:write"},
+					},
+					"relationships": map[string]any{
+						"team": map[string]any{"data": map[string]any{"id": "hcxtm_team1", "type": "teams"}},
+					},
+				},
+				"included": []map[string]any{
+					{"id": "hcxtm_team1", "type": "teams", "attributes": map[string]any{"name": "Test Team", "slug": "test-team"}},
+				},
+			})
+		case "/2/teams/test-team/environments":
+			envListCalls++
+			w.Header().Set("Content-Type", jsonapi.MediaType)
+			envs := []map[string]any{
+				{"id": "hcxen_prod123", "type": "environments", "attributes": map[string]any{"name": "Production", "slug": "production"}},
+			}
+			if hasNewEnv {
+				envs = append(envs, map[string]any{
+					"id": "hcxen_staging456", "type": "environments", "attributes": map[string]any{"name": "Staging", "slug": "staging"},
+				})
+			}
+			json.NewEncoder(w).Encode(map[string]any{"data": envs})
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	t.Cleanup(srv.Close)
+
+	config := logical.TestBackendConfig()
+	config.StorageView = &logical.InmemStorage{}
+	b := backend()
+	require.NoError(t, b.Setup(ctx, config))
+
+	storage := config.StorageView
+
+	// Write config
+	_, err := b.HandleRequest(ctx, &logical.Request{
+		Operation: logical.UpdateOperation,
+		Path:      "config",
+		Storage:   storage,
+		Data: map[string]any{
+			"api_key_id":     "hcxmk_testkey",
+			"api_key_secret": "supersecret",
+			"api_url":        srv.URL,
+		},
+	})
+	require.NoError(t, err)
+
+	// Populate cache with production only
+	id, err := b.resolveEnvironmentID(ctx, storage, "production")
+	require.NoError(t, err)
+	assert.Equal(t, "hcxen_prod123", id)
+	assert.Equal(t, 1, envListCalls)
+
+	// Cache is valid, but staging doesn't exist yet — should refresh
+	_, err = b.resolveEnvironmentID(ctx, storage, "staging")
+	require.Error(t, err, "staging not in API yet")
+	assert.Equal(t, 2, envListCalls, "should have re-fetched on miss despite valid cache")
+
+	// Now add staging to the API
+	hasNewEnv = true
+
+	// Cache was just refreshed (without staging), so it's valid.
+	// A miss should still trigger another refresh.
+	id, err = b.resolveEnvironmentID(ctx, storage, "staging")
+	require.NoError(t, err)
+	assert.Equal(t, "hcxen_staging456", id)
+	assert.Equal(t, 3, envListCalls, "should have re-fetched again for new environment")
+
+	// Now a hit for production should NOT re-fetch
+	id, err = b.resolveEnvironmentID(ctx, storage, "production")
+	require.NoError(t, err)
+	assert.Equal(t, "hcxen_prod123", id)
+	assert.Equal(t, 3, envListCalls, "should use cache for known environment")
+}
+
 func TestEnvCacheResetOnConfigChange(t *testing.T) {
 	ctx := context.Background()
 	b, storage, srv := newTestBackend(t, ctx)

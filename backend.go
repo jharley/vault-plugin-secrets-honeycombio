@@ -111,7 +111,12 @@ func (b *honeycombBackend) reset() {
 	b.envCacheExpiry = time.Time{}
 }
 
+// resolveEnvironmentID maps an environment slug to its Honeycomb ID.
+// Results are cached with a TTL, but a cache miss always triggers a
+// refresh — this ensures newly created environments are accessible
+// without waiting for the cache to expire.
 func (b *honeycombBackend) resolveEnvironmentID(ctx context.Context, s logical.Storage, slug string) (string, error) {
+	// Fast path: return from cache if the slug is known and the cache is fresh.
 	b.lock.RLock()
 	cacheValid := b.envCache != nil && time.Now().Before(b.envCacheExpiry)
 	if cacheValid {
@@ -119,9 +124,13 @@ func (b *honeycombBackend) resolveEnvironmentID(ctx context.Context, s logical.S
 			b.lock.RUnlock()
 			return id, nil
 		}
+		// Slug not in cache — fall through to refresh even though the
+		// cache TTL hasn't expired. A new environment may have been
+		// created since the cache was last populated.
 	}
 	b.lock.RUnlock()
 
+	// Slow path: fetch the full environment list from the API.
 	c, err := b.getClient(ctx, s)
 	if err != nil {
 		return "", err
