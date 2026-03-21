@@ -22,7 +22,7 @@ else
 endif
 
 test:
-	$(GO) test ./...
+	$(GO) test -race ./...
 
 testacc:
 	VAULT_ACC=1 $(GO) test ./... -v -run TestAcceptance
