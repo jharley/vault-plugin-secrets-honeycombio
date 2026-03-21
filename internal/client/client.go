@@ -3,6 +3,7 @@ package client
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"math/rand/v2"
@@ -21,6 +22,10 @@ const (
 	defaultRetryMax     = 3
 	defaultRetryWaitMin = 500 * time.Millisecond
 	defaultRetryWaitMax = 30 * time.Second
+
+	// maxErrorBodySize is the maximum number of bytes read from error
+	// response bodies for inclusion in error messages.
+	maxErrorBodySize = 8192
 )
 
 // Config holds the connection parameters for a Honeycomb API client.
@@ -252,6 +257,10 @@ type Environment struct {
 	Slug string `jsonapi:"attr,slug"`
 }
 
+type paginationLinks struct {
+	Next string `json:"next"`
+}
+
 type apiKey struct {
 	ID          string             `jsonapi:"primary,api-keys"`
 	Name        string             `jsonapi:"attr,name"`
@@ -276,7 +285,7 @@ func (c *Client) Auth(ctx context.Context) (*AuthResponse, error) {
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, maxErrorBodySize))
 		return nil, fmt.Errorf("auth request returned status %d: %s", resp.StatusCode, string(body))
 	}
 
@@ -301,33 +310,59 @@ func (c *Client) Auth(ctx context.Context) (*AuthResponse, error) {
 }
 
 // ListEnvironments returns all environments for the given team.
+// Follows cursor-based pagination to retrieve all pages.
 func (c *Client) ListEnvironments(ctx context.Context) ([]Environment, error) {
-	req, err := retryablehttp.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+"/2/teams/"+c.teamSlug+"/environments", nil)
-	if err != nil {
-		return nil, fmt.Errorf("creating list environments request: %w", err)
+	var allEnvs []Environment
+	endpoint := c.baseURL + "/2/teams/" + c.teamSlug + "/environments"
+
+	for {
+		req, err := retryablehttp.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+		if err != nil {
+			return nil, fmt.Errorf("creating list environments request: %w", err)
+		}
+
+		resp, err := c.do(req)
+		if err != nil {
+			return nil, fmt.Errorf("list environments request: %w", err)
+		}
+
+		if resp.StatusCode != http.StatusOK {
+			body, _ := io.ReadAll(io.LimitReader(resp.Body, maxErrorBodySize))
+			resp.Body.Close()
+			return nil, fmt.Errorf("list environments returned status %d: %s", resp.StatusCode, string(body))
+		}
+
+		// Read the full body so we can decode both data and pagination links.
+		body, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil {
+			return nil, fmt.Errorf("reading environments response: %w", err)
+		}
+
+		items, err := jsonapi.UnmarshalManyPayload(bytes.NewReader(body), reflect.TypeOf(new(Environment)))
+		if err != nil {
+			return nil, fmt.Errorf("decoding environments response: %w", err)
+		}
+
+		for _, item := range items {
+			allEnvs = append(allEnvs, *item.(*Environment)) //nolint:forcetypeassert // type guaranteed by UnmarshalManyPayload
+		}
+
+		// Check for next page via the links object.
+		var page struct {
+			Links *paginationLinks `json:"links"`
+		}
+		if err := json.Unmarshal(body, &page); err != nil {
+			return nil, fmt.Errorf("decoding pagination links: %w", err)
+		}
+
+		if page.Links == nil || page.Links.Next == "" {
+			break
+		}
+		endpoint = c.baseURL + page.Links.Next
 	}
 
-	resp, err := c.do(req)
-	if err != nil {
-		return nil, fmt.Errorf("list environments request: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
-		return nil, fmt.Errorf("list environments returned status %d: %s", resp.StatusCode, string(body))
-	}
-
-	items, err := jsonapi.UnmarshalManyPayload(resp.Body, reflect.TypeOf(new(Environment)))
-	if err != nil {
-		return nil, fmt.Errorf("decoding environments response: %w", err)
-	}
-
-	envs := make([]Environment, len(items))
-	for i, item := range items {
-		envs[i] = *item.(*Environment) //nolint:forcetypeassert // type guaranteed by UnmarshalManyPayload
-	}
-	return envs, nil
+	return allEnvs, nil
 }
 
 // CreateAPIKey creates a new API key in the given team.
@@ -356,7 +391,7 @@ func (c *Client) CreateAPIKey(ctx context.Context, input *CreateAPIKeyRequest) (
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusCreated {
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, maxErrorBodySize))
 		return nil, fmt.Errorf("create API key returned status %d: %s", resp.StatusCode, string(body))
 	}
 
@@ -387,7 +422,7 @@ func (c *Client) DeleteAPIKey(ctx context.Context, keyID string) error {
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusNoContent && resp.StatusCode != http.StatusNotFound {
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, maxErrorBodySize))
 		return fmt.Errorf("delete API key returned status %d: %s", resp.StatusCode, string(body))
 	}
 
