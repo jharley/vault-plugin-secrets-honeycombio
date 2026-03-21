@@ -189,6 +189,30 @@ func (c *Client) rateLimitBackoff(minWait, maxWait time.Duration, resp *http.Res
 	return minWait + jitter
 }
 
+// apiError parses a JSON:API error response and returns a formatted error.
+// Falls back to the raw body if the response is not valid JSON:API.
+func apiError(resp *http.Response) error {
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxErrorBodySize))
+	if err != nil || len(body) == 0 {
+		return fmt.Errorf("status %d", resp.StatusCode)
+	}
+
+	var payload jsonapi.ErrorsPayload
+	if err := json.Unmarshal(body, &payload); err == nil && len(payload.Errors) > 0 {
+		messages := make([]string, len(payload.Errors))
+		for i, e := range payload.Errors {
+			if e.Detail != "" {
+				messages[i] = e.Detail
+			} else {
+				messages[i] = e.Title
+			}
+		}
+		return fmt.Errorf("status %d: %s", resp.StatusCode, strings.Join(messages, "; "))
+	}
+
+	return fmt.Errorf("status %d: %s", resp.StatusCode, string(body))
+}
+
 // AuthResponse contains metadata about the management API key.
 type AuthResponse struct {
 	KeyID    string
@@ -285,8 +309,7 @@ func (c *Client) Auth(ctx context.Context) (*AuthResponse, error) {
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, maxErrorBodySize))
-		return nil, fmt.Errorf("auth request returned status %d: %s", resp.StatusCode, string(body))
+		return nil, fmt.Errorf("auth request: %w", apiError(resp))
 	}
 
 	result := new(authKey)
@@ -327,9 +350,9 @@ func (c *Client) ListEnvironments(ctx context.Context) ([]Environment, error) {
 		}
 
 		if resp.StatusCode != http.StatusOK {
-			body, _ := io.ReadAll(io.LimitReader(resp.Body, maxErrorBodySize))
+			err := fmt.Errorf("list environments: %w", apiError(resp))
 			resp.Body.Close()
-			return nil, fmt.Errorf("list environments returned status %d: %s", resp.StatusCode, string(body))
+			return nil, err
 		}
 
 		// Read the full body so we can decode both data and pagination links.
@@ -391,8 +414,7 @@ func (c *Client) CreateAPIKey(ctx context.Context, input *CreateAPIKeyRequest) (
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusCreated {
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, maxErrorBodySize))
-		return nil, fmt.Errorf("create API key returned status %d: %s", resp.StatusCode, string(body))
+		return nil, fmt.Errorf("create API key: %w", apiError(resp))
 	}
 
 	result := new(apiKey)
@@ -422,8 +444,7 @@ func (c *Client) DeleteAPIKey(ctx context.Context, keyID string) error {
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusNoContent && resp.StatusCode != http.StatusNotFound {
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, maxErrorBodySize))
-		return fmt.Errorf("delete API key returned status %d: %s", resp.StatusCode, string(body))
+		return fmt.Errorf("delete API key: %w", apiError(resp))
 	}
 
 	return nil
