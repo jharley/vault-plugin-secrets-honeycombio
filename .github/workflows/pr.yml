@@ -1,0 +1,92 @@
+name: PR
+
+on:
+  pull_request:
+    types: [opened, edited, synchronize, labeled, unlabeled]
+
+permissions:
+  pull-requests: write
+
+jobs:
+  lint-title:
+    name: Validate PR Title
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check conventional commit prefix
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7
+        with:
+          script: |
+            const title = context.payload.pull_request.title;
+            const prefixes = [
+              'feat:', 'fix:', 'refactor:', 'perf:', 'chore:', 'docs:',
+              'ci:', 'test:', 'deps:', 'feat!:', 'fix!:', 'refactor!:'
+            ];
+            const valid = prefixes.some(p => title.startsWith(p));
+            if (!valid) {
+              core.setFailed(
+                `PR title "${title}" does not follow conventional commits.\n` +
+                `Must start with one of: ${prefixes.join(', ')}`
+              );
+            }
+
+  auto-label:
+    name: Auto-label PR
+    runs-on: ubuntu-latest
+    steps:
+      - name: Apply label from PR title prefix
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7
+        with:
+          script: |
+            const title = context.payload.pull_request.title;
+            const prNumber = context.payload.pull_request.number;
+
+            const mapping = {
+              'feat!:': 'breaking-change',
+              'fix!:': 'breaking-change',
+              'refactor!:': 'breaking-change',
+              'feat:': 'feature',
+              'fix:': 'bug',
+              'deps:': 'dependencies',
+              'refactor:': 'improvement',
+              'perf:': 'improvement',
+              'chore:': 'improvement',
+              'docs:': 'improvement',
+              'ci:': 'improvement',
+              'test:': 'improvement',
+            };
+
+            // Check prefixes longest-first so feat!: matches before feat:
+            const sortedPrefixes = Object.keys(mapping).sort((a, b) => b.length - a.length);
+            let label = null;
+            for (const prefix of sortedPrefixes) {
+              if (title.startsWith(prefix)) {
+                label = mapping[prefix];
+                break;
+              }
+            }
+
+            if (!label) return;
+
+            // Remove any existing auto-applied labels that conflict
+            const autoLabels = new Set(Object.values(mapping));
+            const currentLabels = context.payload.pull_request.labels.map(l => l.name);
+            for (const current of currentLabels) {
+              if (autoLabels.has(current) && current !== label) {
+                await github.rest.issues.removeLabel({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: prNumber,
+                  name: current,
+                });
+              }
+            }
+
+            // Apply the label
+            if (!currentLabels.includes(label)) {
+              await github.rest.issues.addLabels({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: prNumber,
+                labels: [label],
+              });
+            }

@@ -74,8 +74,12 @@ jobs:
       - uses: actions/setup-go@4b73464bb391d4059bd26b0524d20df3927bd417 # v6
         with:
           go-version-file: .go-version
+      - name: Generate release notes
+        run: |
+          TAG="${GITHUB_REF#refs/tags/}"
+          ./scripts/generate-changelog.sh "${TAG}" > /tmp/release-notes.md
       - uses: goreleaser/goreleaser-action@ec59f474b9834571250b370d4735c50f8e2d1e29 # v7
         with:
-          args: release --clean
+          args: release --clean --release-notes /tmp/release-notes.md
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
