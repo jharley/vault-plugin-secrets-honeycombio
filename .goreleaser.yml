@@ -28,6 +28,11 @@ checksum:
   name_template: "{{ .ProjectName }}_SHA256SUMS"
   algorithm: sha256
 
+sboms:
+  - artifacts: binary
+    documents:
+      - "{{ .ArtifactName }}.sbom.cdx.json"
+
 changelog:
   disable: true
 
