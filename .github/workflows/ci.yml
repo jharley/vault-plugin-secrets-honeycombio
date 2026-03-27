@@ -47,7 +47,7 @@ jobs:
       - uses: actions/setup-go@4b73464bb391d4059bd26b0524d20df3927bd417 # v6
         with:
           go-version-file: .go-version
-      - uses: golang/govulncheck-action@b625fbe08f3bccbe446d94fbf87fcc875a4f50ee # v1.0.4
+      - run: go install golang.org/x/vuln/cmd/govulncheck@latest && govulncheck ./...
 
   malcontent:
     name: Malcontent
