@@ -5,6 +5,22 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.1.2 (2026-03-27)
+
+### Features
+
+- parse JSON:API error responses for cleaner error messages (#12)
+
+### Improvements
+
+- verify cache miss triggers refresh for new environments (#11)
+- harden supply chain with vulnerability scanning, malware detection, and SBOMs (#13)
+
+### Dependencies
+
+- bump github.com/hashicorp/vault/api from 1.22.0 to 1.23.0 (#14)
+- bump github.com/hashicorp/vault/sdk from 0.24.0 to 0.25.0 (#14)
+
 ## 0.1.1 (2026-03-21)
 
 ### Bug Fixes
