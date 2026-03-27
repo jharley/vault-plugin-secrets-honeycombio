@@ -74,6 +74,8 @@ jobs:
       - uses: actions/setup-go@4b73464bb391d4059bd26b0524d20df3927bd417 # v6
         with:
           go-version-file: .go-version
+      - name: Install syft
+        run: go install github.com/anchore/syft/cmd/syft@v1.42.3
       - name: Generate release notes
         run: |
           TAG="${GITHUB_REF#refs/tags/}"
