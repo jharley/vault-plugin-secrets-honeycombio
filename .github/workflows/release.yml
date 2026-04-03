@@ -75,7 +75,9 @@ jobs:
         with:
           go-version-file: .go-version
       - name: Install syft
-        run: go install github.com/anchore/syft/cmd/syft@v1.42.3
+        uses: anchore/sbom-action/download-syft@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        with:
+          syft-version: v1.42.3
       - name: Generate release notes
         run: |
           TAG="${GITHUB_REF#refs/tags/}"
