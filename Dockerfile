@@ -9,5 +9,5 @@ RUN CGO_ENABLED=0 go build -o vault-plugin-secrets-honeycombio ./cmd/vault-plugi
 FROM hashicorp/vault:1.21@sha256:4e33b126a59c0c333b76fb4e894722462659a6bec7c48c9ee8cea56fccfd2569 AS vault
 COPY --from=builder /build/vault-plugin-secrets-honeycombio /vault/plugins/vault-plugin-secrets-honeycombio
 
-FROM openbao/openbao:2.5@sha256:6c75c97223873807260352f269640935a07db0c26b3dbf12a98a36ec43ad9878 AS openbao
+FROM openbao/openbao:2.5@sha256:fdc6da21ca6963560c32336fd7feb9cf2d5e52668f1a1647205a4b41171f0806 AS openbao
 COPY --from=builder /build/vault-plugin-secrets-honeycombio /openbao/plugins/vault-plugin-secrets-honeycombio
