@@ -4,6 +4,15 @@
 
 HashiCorp Vault secrets engine plugin for Honeycomb.io. Generates and manages dynamic Configuration Keys and Ingest Keys.
 
+## Skills
+
+Invoke the appropriate skill before acting — this is not optional:
+
+- **Any feature or bugfix implementation:** `superpowers:test-driven-development`
+- **Any bug, test failure, or unexpected behavior:** `superpowers:systematic-debugging`
+- **Before claiming work is complete or creating a PR:** `superpowers:verification-before-completion`
+- **When a feature branch is ready to integrate:** `superpowers:finishing-a-development-branch`
+
 ## Environment
 
 - **Go version:** 1.26 (pinned via `.go-version`, managed by mise)
