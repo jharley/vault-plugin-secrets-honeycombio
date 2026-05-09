@@ -4,6 +4,15 @@
 
 HashiCorp Vault secrets engine plugin for Honeycomb.io. Generates and manages dynamic Configuration Keys and Ingest Keys.
 
+## Skills
+
+Invoke the appropriate skill before acting — this is not optional:
+
+- **Any feature or bugfix implementation:** `superpowers:test-driven-development`
+- **Any bug, test failure, or unexpected behavior:** `superpowers:systematic-debugging`
+- **Before claiming work is complete or creating a PR:** `superpowers:verification-before-completion`
+- **When a feature branch is ready to integrate:** `superpowers:finishing-a-development-branch`
+
 ## Environment
 
 - **Go version:** 1.26 (pinned via `.go-version`, managed by mise)
@@ -22,6 +31,7 @@ HashiCorp Vault secrets engine plugin for Honeycomb.io. Generates and manages dy
 - **Build:** `make build`
 - **Acceptance tests:** `make testacc` (requires `HONEYCOMB_KEY_ID`, `HONEYCOMB_KEY_SECRET`, `HONEYCOMB_ENVIRONMENT` env vars)
 - Test helpers (`newTestBackend`, `newTestClient`) register cleanup via `t.Cleanup` — callers should NOT call `defer srv.Close()`.
+- **Check module hygiene:** `go mod tidy` — CI verifies `go.mod` and `go.sum` are tidy; run this before committing whenever imports or dependencies change.
 
 ## Code Style
 
@@ -30,6 +40,26 @@ HashiCorp Vault secrets engine plugin for Honeycomb.io. Generates and manages dy
 - A minimal Honeycomb API client lives in `internal/client/`.
 - Vault SDK `FieldData.Get()` type assertions are idiomatic and should use `//nolint:forcetypeassert`. When multiple assertions are grouped, add a single explanatory comment above the block.
 - `context.Context` should be created at the entry point (test function, handler, `main`) and propagated through all calls. Never call `context.Background()` deep in a call chain — accept a `ctx` parameter instead.
+- Prefer `ls` and `grep` for filesystem exploration — avoid `find` unless necessary; it is not in the project allow-list and will trigger a permission prompt.
+
+## Commit & PR Conventions
+
+**Never commit directly to `main`.** All changes must be made on a feature branch and merged via PR.
+
+PR titles must use conventional commit prefixes (enforced by CI):
+
+| Prefix | When to use |
+|--------|-------------|
+| `feat:` / `feat!:` | New feature / breaking feature |
+| `fix:` / `fix!:` | Bug fix / breaking fix |
+| `refactor:` / `refactor!:` | Code restructuring / breaking restructuring |
+| `perf:` | Performance improvement |
+| `chore:` | Maintenance, tooling |
+| `docs:` | Documentation only |
+| `ci:` | CI/CD changes |
+| `test:` | Test-only changes |
+| `deps:` | Dependency updates |
+| `rel:` | Release commits |
 
 ## Honeycomb API
 
