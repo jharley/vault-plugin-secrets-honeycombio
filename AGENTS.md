@@ -31,7 +31,7 @@ Invoke the appropriate skill before acting — this is not optional:
 - **Build:** `make build`
 - **Acceptance tests:** `make testacc` (requires `HONEYCOMB_KEY_ID`, `HONEYCOMB_KEY_SECRET`, `HONEYCOMB_ENVIRONMENT` env vars)
 - Test helpers (`newTestBackend`, `newTestClient`) register cleanup via `t.Cleanup` — callers should NOT call `defer srv.Close()`.
-- **Check module hygiene:** `go mod tidy` — CI verifies `go.mod` and `go.sum` are tidy; run this before committing when dependencies change.
+- **Check module hygiene:** `go mod tidy` — CI verifies `go.mod` and `go.sum` are tidy; run this before committing whenever imports or dependencies change.
 
 ## Code Style
 
@@ -40,7 +40,7 @@ Invoke the appropriate skill before acting — this is not optional:
 - A minimal Honeycomb API client lives in `internal/client/`.
 - Vault SDK `FieldData.Get()` type assertions are idiomatic and should use `//nolint:forcetypeassert`. When multiple assertions are grouped, add a single explanatory comment above the block.
 - `context.Context` should be created at the entry point (test function, handler, `main`) and propagated through all calls. Never call `context.Background()` deep in a call chain — accept a `ctx` parameter instead.
-- Prefer `ls` and `grep` for filesystem exploration — avoid `find` unless necessary; it requires explicit permission.
+- Prefer `ls` and `grep` for filesystem exploration — avoid `find` unless necessary; it is not in the project allow-list and will trigger a permission prompt.
 
 ## Commit & PR Conventions
 
