@@ -44,6 +44,8 @@ Invoke the appropriate skill before acting — this is not optional:
 
 ## Commit & PR Conventions
 
+**Never commit directly to `main`.** All changes must be made on a feature branch and merged via PR.
+
 PR titles must use conventional commit prefixes (enforced by CI):
 
 | Prefix | When to use |
