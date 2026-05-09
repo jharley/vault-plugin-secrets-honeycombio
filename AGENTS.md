@@ -40,6 +40,23 @@ Invoke the appropriate skill before acting — this is not optional:
 - Vault SDK `FieldData.Get()` type assertions are idiomatic and should use `//nolint:forcetypeassert`. When multiple assertions are grouped, add a single explanatory comment above the block.
 - `context.Context` should be created at the entry point (test function, handler, `main`) and propagated through all calls. Never call `context.Background()` deep in a call chain — accept a `ctx` parameter instead.
 
+## Commit & PR Conventions
+
+PR titles must use conventional commit prefixes (enforced by CI):
+
+| Prefix | When to use |
+|--------|-------------|
+| `feat:` / `feat!:` | New feature / breaking feature |
+| `fix:` / `fix!:` | Bug fix / breaking fix |
+| `refactor:` | Code restructuring, no behavior change |
+| `perf:` | Performance improvement |
+| `chore:` | Maintenance, tooling |
+| `docs:` | Documentation only |
+| `ci:` | CI/CD changes |
+| `test:` | Test-only changes |
+| `deps:` | Dependency updates |
+| `rel:` | Release commits |
+
 ## Honeycomb API
 
 - Honeycomb API OpenAPI spec: `https://api.honeycomb.io/api.yaml`
