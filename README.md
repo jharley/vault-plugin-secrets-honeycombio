@@ -120,7 +120,7 @@ $ vault lease revoke honeycomb/creds/production-ingest/abcd1234...
 
 ## Developing
 
-**Requirements:** Go 1.26.1 (see `.go-version`)
+**Requirements:** Go 1.26 (see `.go-version`)
 
 ```sh
 $ make build    # compile the plugin binary

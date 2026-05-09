@@ -6,7 +6,7 @@ HashiCorp Vault secrets engine plugin for Honeycomb.io. Generates and manages dy
 
 ## Environment
 
-- **Go version:** 1.26.1 (pinned via `.go-version`, managed by mise)
+- **Go version:** 1.26 (pinned via `.go-version`, managed by mise)
 - Use the Makefile for all build/test/lint commands — it handles mise activation automatically if needed.
 - **Docker:** `make validate` / `make validate-down` to run Vault + OpenBao with the plugin loaded.
 
