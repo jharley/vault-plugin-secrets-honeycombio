@@ -48,7 +48,7 @@ PR titles must use conventional commit prefixes (enforced by CI):
 |--------|-------------|
 | `feat:` / `feat!:` | New feature / breaking feature |
 | `fix:` / `fix!:` | Bug fix / breaking fix |
-| `refactor:` | Code restructuring, no behavior change |
+| `refactor:` / `refactor!:` | Code restructuring / breaking restructuring |
 | `perf:` | Performance improvement |
 | `chore:` | Maintenance, tooling |
 | `docs:` | Documentation only |
