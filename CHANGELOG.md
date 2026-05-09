@@ -15,7 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Dependencies
 
 - bump actions/github-script from 8.0.0 to 9.0.0 (#23)
-- bump github.com/hashicorp/vault/sdk from 0.25.0 to 0.25.1 in the hashicorp group across 1 directory (#24)
+- bump github.com/hashicorp/vault/sdk from 0.25.0 to 0.25.1 (#24)
 - bump Go from 1.26.1 to 1.26.2 (#25)
 - bump github.com/jackc/pgx/v5 from 5.9.1 to 5.9.2 (#26)
 - bump goreleaser/goreleaser-action from 7.0.0 to 7.1.0 (#27)
