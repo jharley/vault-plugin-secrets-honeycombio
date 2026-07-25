@@ -2,7 +2,12 @@ package honeycombio
 
 import (
 	"context"
+	"fmt"
+	"net/url"
+	"os"
 	"slices"
+	"strconv"
+	"strings"
 
 	"github.com/hashicorp/vault/sdk/framework"
 	"github.com/hashicorp/vault/sdk/logical"
@@ -13,7 +18,43 @@ import (
 const (
 	configStoragePath = "config"
 	defaultAPIURL     = "https://api.honeycomb.io"
+
+	// allowInsecureURLEnv opts out of the HTTPS requirement on api_url.
+	// Intended for development against a local mock endpoint; setting it in
+	// production sends the Honeycomb management key over the wire in
+	// cleartext on every request.
+	allowInsecureURLEnv = "HONEYCOMB_ALLOW_INSECURE_URL"
 )
+
+// validateAPIURL checks that the configured API URL is well formed and uses
+// HTTPS. Plaintext endpoints are rejected unless allowInsecureURLEnv is set,
+// since every request carries the management key in an Authorization header.
+func validateAPIURL(raw string) error {
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		return fmt.Errorf("api_url is not a valid URL: %w", err)
+	}
+	if parsed.Host == "" {
+		return fmt.Errorf("api_url must include a host (got %q)", raw)
+	}
+
+	switch parsed.Scheme {
+	case "https":
+		return nil
+	case "http":
+		if allowInsecureURL() {
+			return nil
+		}
+		return fmt.Errorf("api_url must use https (set %s=true to allow plaintext for development)", allowInsecureURLEnv)
+	default:
+		return fmt.Errorf("api_url must use https, got scheme %q", parsed.Scheme)
+	}
+}
+
+func allowInsecureURL() bool {
+	allowed, err := strconv.ParseBool(os.Getenv(allowInsecureURLEnv))
+	return err == nil && allowed
+}
 
 type honeycombConfig struct {
 	APIKeyID     string `json:"api_key_id"`
@@ -104,8 +145,12 @@ func (b *honeycombBackend) pathConfigWrite(ctx context.Context, req *logical.Req
 	if apiKeySecret == "" {
 		return logical.ErrorResponse("api_key_secret is required"), nil
 	}
+	apiURL = strings.TrimSpace(apiURL)
 	if apiURL == "" {
 		apiURL = defaultAPIURL
+	}
+	if err := validateAPIURL(apiURL); err != nil {
+		return logical.ErrorResponse(err.Error()), nil
 	}
 
 	// Validate credentials — New() calls /2/auth to verify the keypair

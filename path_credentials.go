@@ -32,6 +32,10 @@ func pathCredentials(b *honeycombBackend) *framework.Path {
 		Operations: map[logical.Operation]framework.OperationHandler{
 			logical.ReadOperation: &framework.PathOperation{
 				Callback: b.pathCredentialsRead,
+				// Generating a credential writes a WAL entry, so this read
+				// must run on a node with writable storage.
+				ForwardPerformanceStandby:   true,
+				ForwardPerformanceSecondary: true,
 			},
 		},
 		HelpSynopsis:    "Generate a Honeycomb API key",

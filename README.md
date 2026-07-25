@@ -48,6 +48,11 @@ The plugin validates the keypair against the Honeycomb API and extracts the team
 
 Set `api_url` to `https://api.eu1.honeycomb.io` for EU region environments.
 
+`api_url` must use HTTPS. Every request carries the management key in an
+`Authorization` header, so a plaintext endpoint would expose it on the wire.
+For development against a local mock endpoint, set `HONEYCOMB_ALLOW_INSECURE_URL=true`
+in the Vault server's environment to permit `http://` URLs. Do not set this in production.
+
 ### Create a Role
 
 Roles define the key type, target environment, and permissions:

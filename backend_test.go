@@ -16,8 +16,16 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// allowPlaintextAPIURL permits the plaintext endpoints served by httptest.
+// api_url requires HTTPS unless this escape hatch is set.
+func allowPlaintextAPIURL(t *testing.T) {
+	t.Helper()
+	t.Setenv("HONEYCOMB_ALLOW_INSECURE_URL", "true")
+}
+
 func newTestBackend(t *testing.T, ctx context.Context) (*honeycombBackend, logical.Storage, *httptest.Server) {
 	t.Helper()
+	allowPlaintextAPIURL(t)
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
@@ -159,6 +167,7 @@ func TestConfigWrite_MissingFields(t *testing.T) {
 
 func TestConfigWrite_BadCredentials(t *testing.T) {
 	ctx := context.Background()
+	allowPlaintextAPIURL(t)
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusUnauthorized)
@@ -188,6 +197,7 @@ func TestConfigWrite_BadCredentials(t *testing.T) {
 
 func TestConfigWrite_MissingScopeRejected(t *testing.T) {
 	ctx := context.Background()
+	allowPlaintextAPIURL(t)
 
 	// Mock server returning a management key without api-keys:write scope
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -229,6 +239,162 @@ func TestConfigWrite_MissingScopeRejected(t *testing.T) {
 	require.NotNil(t, resp)
 	assert.True(t, resp.IsError())
 	assert.Contains(t, resp.Data["error"], "api-keys:write")
+}
+
+func TestValidateAPIURL(t *testing.T) {
+	valid := []string{
+		"https://api.honeycomb.io",
+		"https://api.eu1.honeycomb.io",
+		"https://honeycomb.invalid:8443/prefix",
+	}
+	for _, u := range valid {
+		t.Run("accepts "+u, func(t *testing.T) {
+			require.NoError(t, validateAPIURL(u))
+		})
+	}
+
+	invalid := map[string]string{
+		"plaintext":      "http://honeycomb.invalid",
+		"no host":        "https://",
+		"unknown scheme": "ftp://honeycomb.invalid",
+		"missing scheme": "honeycomb.invalid",
+		"not a url":      "://nonsense",
+	}
+	for name, u := range invalid {
+		t.Run("rejects "+name, func(t *testing.T) {
+			require.Error(t, validateAPIURL(u))
+		})
+	}
+}
+
+func TestValidateAPIURL_EscapeHatchAllowsPlaintext(t *testing.T) {
+	require.Error(t, validateAPIURL("http://honeycomb.invalid"),
+		"plaintext must be rejected without the escape hatch")
+
+	allowPlaintextAPIURL(t)
+	require.NoError(t, validateAPIURL("http://honeycomb.invalid"),
+		"escape hatch must permit plaintext")
+
+	require.Error(t, validateAPIURL("ftp://honeycomb.invalid"),
+		"escape hatch must not permit non-HTTP schemes")
+}
+
+// TestConfigWrite_RejectsPlaintextURL verifies that api_url must use HTTPS.
+// A plaintext endpoint sends the Honeycomb management key over the wire in
+// cleartext on every request.
+func TestConfigWrite_RejectsPlaintextURL(t *testing.T) {
+	ctx := context.Background()
+	b, storage, srv := newTestBackend(t, ctx)
+	t.Setenv("HONEYCOMB_ALLOW_INSECURE_URL", "")
+
+	resp, err := b.HandleRequest(ctx, &logical.Request{
+		Operation: logical.CreateOperation,
+		Path:      "config",
+		Storage:   storage,
+		Data: map[string]any{
+			"api_key_id":     "hcxmk_testkey",
+			"api_key_secret": "supersecret",
+			"api_url":        srv.URL,
+		},
+	})
+	require.NoError(t, err)
+	require.NotNil(t, resp)
+	require.True(t, resp.IsError(), "plaintext api_url should be rejected")
+	assert.Contains(t, resp.Error().Error(), "https")
+}
+
+// TestConfigWrite_AllowsPlaintextURLWithEscapeHatch verifies the documented
+// development escape hatch re-enables plaintext endpoints.
+func TestConfigWrite_AllowsPlaintextURLWithEscapeHatch(t *testing.T) {
+	ctx := context.Background()
+
+	for _, value := range []string{"true", "1", "TRUE"} {
+		t.Run(value, func(t *testing.T) {
+			b, storage, srv := newTestBackend(t, ctx)
+			t.Setenv("HONEYCOMB_ALLOW_INSECURE_URL", value)
+
+			resp, err := b.HandleRequest(ctx, &logical.Request{
+				Operation: logical.CreateOperation,
+				Path:      "config",
+				Storage:   storage,
+				Data: map[string]any{
+					"api_key_id":     "hcxmk_testkey",
+					"api_key_secret": "supersecret",
+					"api_url":        srv.URL,
+				},
+			})
+			require.NoError(t, err)
+			assert.False(t, resp.IsError(), "escape hatch should permit plaintext api_url")
+		})
+	}
+}
+
+func TestConfigWrite_RejectsMalformedURL(t *testing.T) {
+	ctx := context.Background()
+
+	// Every case must be rejected before any network call is attempted;
+	// hosts use the reserved .invalid TLD so a regression cannot reach out.
+	for name, apiURL := range map[string]string{
+		"not a url":          "://nonsense",
+		"no host":            "https://",
+		"unknown scheme":     "ftp://honeycomb.invalid",
+		"missing scheme":     "honeycomb.invalid",
+		"invalid characters": "https://honey comb.invalid",
+	} {
+		t.Run(name, func(t *testing.T) {
+			b, storage, _ := newTestBackend(t, ctx)
+
+			resp, err := b.HandleRequest(ctx, &logical.Request{
+				Operation: logical.CreateOperation,
+				Path:      "config",
+				Storage:   storage,
+				Data: map[string]any{
+					"api_key_id":     "hcxmk_testkey",
+					"api_key_secret": "supersecret",
+					"api_url":        apiURL,
+				},
+			})
+			require.NoError(t, err)
+			require.NotNil(t, resp)
+			assert.True(t, resp.IsError(), "malformed api_url %q should be rejected", apiURL)
+		})
+	}
+}
+
+// TestCredentialsPath_RequestsHAForwarding verifies the creds path asks Vault
+// to forward the request. It writes a WAL entry to storage, which is read-only
+// on a performance standby or secondary.
+func TestCredentialsPath_RequestsHAForwarding(t *testing.T) {
+	props := pathCredentials(backend()).Operations[logical.ReadOperation].Properties()
+
+	assert.True(t, props.ForwardPerformanceStandby,
+		"creds path writes a WAL entry and must be forwarded from performance standbys")
+	assert.True(t, props.ForwardPerformanceSecondary,
+		"creds path writes a WAL entry and must be forwarded from performance secondaries")
+}
+
+func TestRoleWrite_RejectsTTLAboveMaxTTL(t *testing.T) {
+	ctx := context.Background()
+	b, storage, _ := newTestBackend(t, ctx)
+
+	resp, err := b.HandleRequest(ctx, &logical.Request{
+		Operation: logical.CreateOperation,
+		Path:      "roles/bad-ttl",
+		Storage:   storage,
+		Data: map[string]any{
+			"key_type":    "ingest",
+			"environment": "production",
+			"send_events": false,
+
+			"create_datasets": true,
+			"ttl":             "24h",
+			"max_ttl":         "1h",
+		},
+	})
+	require.NoError(t, err)
+	require.NotNil(t, resp)
+	require.True(t, resp.IsError(), "ttl greater than max_ttl should be rejected")
+	assert.Contains(t, resp.Error().Error(), "max_ttl")
 }
 
 func TestRoleWriteRead(t *testing.T) {
@@ -790,10 +956,12 @@ func TestSecretRevoke_ClientUnavailable(t *testing.T) {
 	assert.Contains(t, resp.Warnings[0], "hcxik_orphaned")
 }
 
-func TestSecretRevoke_DeleteFails(t *testing.T) {
-	ctx := context.Background()
+// newRevokeFailureBackend builds a backend whose DELETE requests always fail
+// with the given status.
+func newRevokeFailureBackend(t *testing.T, ctx context.Context, deleteStatus int) (*honeycombBackend, logical.Storage) {
+	t.Helper()
+	allowPlaintextAPIURL(t)
 
-	// Mock server that accepts auth but returns 500 on delete
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case r.URL.Path == "/2/auth":
@@ -814,7 +982,7 @@ func TestSecretRevoke_DeleteFails(t *testing.T) {
 				},
 			})
 		case r.Method == http.MethodDelete:
-			w.WriteHeader(http.StatusInternalServerError)
+			w.WriteHeader(deleteStatus)
 		default:
 			w.WriteHeader(http.StatusNotFound)
 		}
@@ -826,7 +994,6 @@ func TestSecretRevoke_DeleteFails(t *testing.T) {
 	b := backend()
 	require.NoError(t, b.Setup(ctx, config))
 
-	// Write config
 	_, err := b.HandleRequest(ctx, &logical.Request{
 		Operation: logical.UpdateOperation,
 		Path:      "config",
@@ -843,24 +1010,75 @@ func TestSecretRevoke_DeleteFails(t *testing.T) {
 	cachedClient, _ := b.getClient(ctx, config.StorageView)
 	cachedClient.SetRetryWait(0, 0)
 
-	// Revoke should return warning, not error
-	resp, err := b.secretKeyRevoke(ctx, &logical.Request{
-		Storage: config.StorageView,
-		Secret: &logical.Secret{
-			InternalData: map[string]any{
-				"key_id":    "hcxik_faildelete",
-				"role_name": "test-role",
-			},
-		},
-	}, &framework.FieldData{})
-	require.NoError(t, err, "should not return error — returns warning instead")
-	require.NotNil(t, resp)
-	require.Len(t, resp.Warnings, 1)
-	assert.Contains(t, resp.Warnings[0], "hcxik_faildelete")
+	return b, config.StorageView
+}
+
+// TestSecretRevoke_TransientFailureReturnsError verifies that a transient
+// upstream failure surfaces as an error so Vault retries revocation. Reporting
+// success would drop the lease while the key stays live in Honeycomb.
+func TestSecretRevoke_TransientFailureReturnsError(t *testing.T) {
+	ctx := context.Background()
+
+	for name, status := range map[string]int{
+		"server error":    http.StatusInternalServerError,
+		"bad gateway":     http.StatusBadGateway,
+		"rate limited":    http.StatusTooManyRequests,
+		"gateway timeout": http.StatusGatewayTimeout,
+		"unavailable":     http.StatusServiceUnavailable,
+		"request timeout": http.StatusRequestTimeout,
+	} {
+		t.Run(name, func(t *testing.T) {
+			b, storage := newRevokeFailureBackend(t, ctx, status)
+
+			_, err := b.secretKeyRevoke(ctx, &logical.Request{
+				Storage: storage,
+				Secret: &logical.Secret{
+					InternalData: map[string]any{
+						"key_id":    "hcxik_faildelete",
+						"role_name": "test-role",
+					},
+				},
+			}, &framework.FieldData{})
+			require.Error(t, err, "transient revocation failure must be retryable")
+			assert.Contains(t, err.Error(), "hcxik_faildelete")
+		})
+	}
+}
+
+// TestSecretRevoke_PermanentFailureWarns verifies that an unrecoverable
+// failure warns and lets the lease expire, rather than making Vault retry a
+// revocation that can never succeed.
+func TestSecretRevoke_PermanentFailureWarns(t *testing.T) {
+	ctx := context.Background()
+
+	for name, status := range map[string]int{
+		"unauthorized": http.StatusUnauthorized,
+		"forbidden":    http.StatusForbidden,
+		"bad request":  http.StatusBadRequest,
+	} {
+		t.Run(name, func(t *testing.T) {
+			b, storage := newRevokeFailureBackend(t, ctx, status)
+
+			resp, err := b.secretKeyRevoke(ctx, &logical.Request{
+				Storage: storage,
+				Secret: &logical.Secret{
+					InternalData: map[string]any{
+						"key_id":    "hcxik_faildelete",
+						"role_name": "test-role",
+					},
+				},
+			}, &framework.FieldData{})
+			require.NoError(t, err, "permanent failure should not be retried forever")
+			require.NotNil(t, resp)
+			require.Len(t, resp.Warnings, 1)
+			assert.Contains(t, resp.Warnings[0], "hcxik_faildelete")
+		})
+	}
 }
 
 func TestEnvCacheHit(t *testing.T) {
 	ctx := context.Background()
+	allowPlaintextAPIURL(t)
 
 	envListCalls := 0
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -931,6 +1149,7 @@ func TestEnvCacheHit(t *testing.T) {
 
 func TestEnvCacheExpiry(t *testing.T) {
 	ctx := context.Background()
+	allowPlaintextAPIURL(t)
 
 	envListCalls := 0
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1030,6 +1249,7 @@ func TestEnvCacheMiss(t *testing.T) {
 
 func TestEnvCacheMissRefreshesOnNewEnvironment(t *testing.T) {
 	ctx := context.Background()
+	allowPlaintextAPIURL(t)
 
 	envListCalls := 0
 	hasNewEnv := false
