@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"math/rand/v2"
@@ -13,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/hashicorp/go-hclog"
 	"github.com/hashicorp/go-retryablehttp"
@@ -43,7 +45,19 @@ const (
 	// it is converted to a Duration, so an absurd value cannot overflow the
 	// int64 nanosecond representation.
 	maxRateLimitReset = 24 * time.Hour
+
+	// maxRedirects bounds redirect chains within the configured origin.
+	maxRedirects = 5
+
+	// maxErrorDetailLength bounds how much server-supplied text is carried in
+	// an APIError. The detail reaches Vault lease warnings and the audit log,
+	// so it is kept short rather than echoing an arbitrary response body.
+	maxErrorDetailLength = 512
 )
+
+// errRedirectRefused marks a redirect rejected by policy. It is deterministic,
+// so retrying cannot help.
+var errRedirectRefused = errors.New("refusing to follow redirect")
 
 // Config holds the connection parameters for a Honeycomb API client.
 type Config struct {
@@ -109,7 +123,7 @@ func New(ctx context.Context, cfg *Config) (*Client, error) {
 		Backoff:      c.retryBackoff,
 		CheckRetry:   c.retryCheck,
 		ErrorHandler: retryablehttp.PassthroughErrorHandler,
-		HTTPClient:   &http.Client{Timeout: 30 * time.Second},
+		HTTPClient:   &http.Client{Timeout: 30 * time.Second, CheckRedirect: c.checkRedirect},
 		Logger:       logger.Named("honeycomb.http"),
 		RetryWaitMin: defaultRetryWaitMin,
 		RetryWaitMax: defaultRetryWaitMax,
@@ -154,6 +168,9 @@ func (c *Client) do(req *retryablehttp.Request) (*http.Response, error) {
 func (c *Client) retryCheck(ctx context.Context, resp *http.Response, err error) (bool, error) {
 	if ctx.Err() != nil {
 		return false, ctx.Err()
+	}
+	if errors.Is(err, errRedirectRefused) {
+		return false, err
 	}
 	if err != nil {
 		return true, err
@@ -217,10 +234,7 @@ func (c *Client) rateLimitBackoff(minWait, maxWait time.Duration, resp *http.Res
 	if reset > minWait {
 		minWait = reset
 	}
-	if minWait > maxWait {
-		minWait = maxWait
-	}
-	return minWait + jitter
+	return min(minWait+jitter, maxWait)
 }
 
 // secondsToDuration converts a server-supplied second count to a Duration,
@@ -277,10 +291,30 @@ func apiError(resp *http.Response) error {
 				messages[i] = e.Title
 			}
 		}
-		return &APIError{StatusCode: resp.StatusCode, Detail: strings.Join(messages, "; ")}
+		return &APIError{StatusCode: resp.StatusCode, Detail: truncateDetail(strings.Join(messages, "; "))}
 	}
 
-	return &APIError{StatusCode: resp.StatusCode, Detail: string(body)}
+	return &APIError{StatusCode: resp.StatusCode, Detail: truncateDetail(string(body))}
+}
+
+// truncateDetail bounds server-supplied error text. It surfaces in Vault lease
+// warnings and the audit log, so an arbitrary response body is not echoed
+// wholesale.
+func truncateDetail(s string) string {
+	s = strings.Map(func(r rune) rune {
+		if r == '\n' || r == '\t' {
+			return ' '
+		}
+		if unicode.IsControl(r) {
+			return -1
+		}
+		return r
+	}, strings.TrimSpace(s))
+
+	if len(s) > maxErrorDetailLength {
+		return s[:maxErrorDetailLength] + "… (truncated)"
+	}
+	return s
 }
 
 // AuthResponse contains metadata about the management API key.
@@ -382,8 +416,13 @@ func (c *Client) Auth(ctx context.Context) (*AuthResponse, error) {
 		return nil, fmt.Errorf("auth request: %w", apiError(resp))
 	}
 
+	body, err := readLimited(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("reading auth response: %w", err)
+	}
+
 	result := new(authKey)
-	if err := jsonapi.UnmarshalPayload(resp.Body, result); err != nil {
+	if err := jsonapi.UnmarshalPayload(bytes.NewReader(body), result); err != nil {
 		return nil, fmt.Errorf("decoding auth response: %w", err)
 	}
 
@@ -406,7 +445,7 @@ func (c *Client) Auth(ctx context.Context) (*AuthResponse, error) {
 // Follows cursor-based pagination to retrieve all pages.
 func (c *Client) ListEnvironments(ctx context.Context) ([]Environment, error) {
 	var allEnvs []Environment
-	endpoint := c.baseURL + "/2/teams/" + c.teamSlug + "/environments"
+	endpoint := c.baseURL + "/2/teams/" + url.PathEscape(c.teamSlug) + "/environments"
 
 	for page := 0; ; page++ {
 		if page >= maxPaginationPages {
@@ -467,20 +506,46 @@ func (c *Client) ListEnvironments(ctx context.Context) ([]Environment, error) {
 	return allEnvs, nil
 }
 
-// resolveAPIURL resolves a server-supplied link against the configured base
-// URL and rejects anything that would leave the configured API origin.
-// Without this check a link such as "@evil.example/path" reparses the base URL
-// as a userinfo component, sending the management key to another host.
+// resolveAPIURL turns a server-supplied link into a request URL, refusing
+// anything that would leave the configured API origin. Without this check a
+// link such as "@evil.example/path" reparses the base URL as a userinfo
+// component, sending the management key to another host.
 func (c *Client) resolveAPIURL(link string) (string, error) {
-	ref, err := c.base.Parse(link)
+	ref, err := url.Parse(link)
 	if err != nil {
 		return "", fmt.Errorf("parsing pagination link %q: %w", link, err)
 	}
-	if ref.Scheme != c.base.Scheme || ref.Host != c.base.Host {
-		return "", fmt.Errorf("refusing to follow pagination link %q: resolves to %s://%s, expected %s://%s",
-			link, ref.Scheme, ref.Host, c.base.Scheme, c.base.Host)
+
+	// A link carrying its own scheme or authority must match the configured
+	// origin exactly.
+	if ref.Scheme != "" || ref.Host != "" {
+		if ref.Scheme != c.base.Scheme || ref.Host != c.base.Host {
+			return "", fmt.Errorf("refusing to follow pagination link %q: resolves to %s://%s, expected %s://%s",
+				link, ref.Scheme, ref.Host, c.base.Scheme, c.base.Host)
+		}
+		ref.User = nil // never echo credentials from a server-supplied link
+		return ref.String(), nil
 	}
-	return ref.String(), nil
+
+	// A path-only link is re-anchored on the configured base URL rather than
+	// resolved as a URL reference, so that a base with a path prefix (an API
+	// reached through a proxy mounted under a subpath) keeps that prefix.
+	return c.baseURL + "/" + strings.TrimPrefix(ref.String(), "/"), nil
+}
+
+// checkRedirect refuses any redirect that leaves the configured API origin.
+// Go strips the Authorization header only across domains, so a redirect to a
+// different port, to a subdomain, or downgrading https to http on the same
+// host would otherwise carry the management key along with it.
+func (c *Client) checkRedirect(req *http.Request, via []*http.Request) error {
+	if len(via) >= maxRedirects {
+		return fmt.Errorf("%w: stopped after %d redirects", errRedirectRefused, maxRedirects)
+	}
+	if req.URL.Scheme != c.base.Scheme || req.URL.Host != c.base.Host {
+		return fmt.Errorf("%w to %s://%s, expected %s://%s",
+			errRedirectRefused, req.URL.Scheme, req.URL.Host, c.base.Scheme, c.base.Host)
+	}
+	return nil
 }
 
 // readLimited reads r into memory, refusing bodies larger than
@@ -511,7 +576,7 @@ func (c *Client) CreateAPIKey(ctx context.Context, input *CreateAPIKeyRequest) (
 		return nil, fmt.Errorf("marshaling create API key request: %w", err)
 	}
 
-	req, err := retryablehttp.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/2/teams/"+c.teamSlug+"/api-keys", &buf)
+	req, err := retryablehttp.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/2/teams/"+url.PathEscape(c.teamSlug)+"/api-keys", &buf)
 	if err != nil {
 		return nil, fmt.Errorf("creating API key request: %w", err)
 	}
@@ -526,9 +591,17 @@ func (c *Client) CreateAPIKey(ctx context.Context, input *CreateAPIKeyRequest) (
 		return nil, fmt.Errorf("create API key: %w", apiError(resp))
 	}
 
+	body, err := readLimited(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("reading create API key response: %w", err)
+	}
+
 	result := new(apiKey)
-	if err := jsonapi.UnmarshalPayload(resp.Body, result); err != nil {
+	if err := jsonapi.UnmarshalPayload(bytes.NewReader(body), result); err != nil {
 		return nil, fmt.Errorf("decoding create API key response: %w", err)
+	}
+	if result.ID == "" {
+		return nil, fmt.Errorf("create API key: response contained no key ID")
 	}
 
 	return &APIKeyResponse{
@@ -541,7 +614,7 @@ func (c *Client) CreateAPIKey(ctx context.Context, input *CreateAPIKeyRequest) (
 
 // DeleteAPIKey deletes an API key. Treats 404 as success (idempotent).
 func (c *Client) DeleteAPIKey(ctx context.Context, keyID string) error {
-	req, err := retryablehttp.NewRequestWithContext(ctx, http.MethodDelete, c.baseURL+"/2/teams/"+c.teamSlug+"/api-keys/"+keyID, nil)
+	req, err := retryablehttp.NewRequestWithContext(ctx, http.MethodDelete, c.baseURL+"/2/teams/"+url.PathEscape(c.teamSlug)+"/api-keys/"+url.PathEscape(keyID), nil)
 	if err != nil {
 		return fmt.Errorf("creating delete API key request: %w", err)
 	}
@@ -552,7 +625,7 @@ func (c *Client) DeleteAPIKey(ctx context.Context, keyID string) error {
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusNoContent && resp.StatusCode != http.StatusNotFound {
+	if resp.StatusCode/100 != 2 && resp.StatusCode != http.StatusNotFound {
 		return fmt.Errorf("delete API key: %w", apiError(resp))
 	}
 

@@ -51,6 +51,14 @@ func validateAPIURL(raw string) error {
 	}
 }
 
+// invalidConfigError marks a stored configuration that cannot be used as-is.
+// It is permanent until an operator rewrites the config, so callers must not
+// retry against it.
+type invalidConfigError struct{ err error }
+
+func (e *invalidConfigError) Error() string { return e.err.Error() }
+func (e *invalidConfigError) Unwrap() error { return e.err }
+
 func allowInsecureURL() bool {
 	allowed, err := strconv.ParseBool(os.Getenv(allowInsecureURLEnv))
 	return err == nil && allowed
@@ -123,14 +131,23 @@ func (b *honeycombBackend) pathConfigRead(ctx context.Context, req *logical.Requ
 		return nil, nil
 	}
 
-	return &logical.Response{
+	resp := &logical.Response{
 		Data: map[string]any{
 			"api_key_id":     cfg.APIKeyID,
 			"api_key_secret": "<redacted>",
 			"api_url":        cfg.APIURL,
 			"team_slug":      cfg.TeamSlug,
 		},
-	}, nil
+	}
+
+	// Surface a stored URL that would no longer be accepted, so an operator
+	// upgrading from a version without this check can see why the mount has
+	// stopped working.
+	if err := validateAPIURL(cfg.APIURL); err != nil {
+		resp.Warnings = []string{fmt.Sprintf("stored api_url is no longer valid: %s", err)}
+	}
+
+	return resp, nil
 }
 
 func (b *honeycombBackend) pathConfigWrite(ctx context.Context, req *logical.Request, d *framework.FieldData) (*logical.Response, error) {

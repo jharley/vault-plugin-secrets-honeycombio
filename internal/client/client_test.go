@@ -402,13 +402,17 @@ func TestClient_ListEnvironments_RejectsForeignPaginationLink(t *testing.T) {
 	t.Cleanup(foreign.Close)
 	foreignHost := strings.TrimPrefix(foreign.URL, "http://")
 
-	tests := map[string]string{
-		"userinfo confusion": "@" + foreignHost + "/2/teams/my-team/environments",
-		"absolute URL":       foreign.URL + "/2/teams/my-team/environments",
-		"protocol relative":  "//" + foreignHost + "/2/teams/my-team/environments",
+	// wantErr pins each case to the mechanism that actually rejects it, so a
+	// passing test cannot be satisfied by an unrelated failure. A link
+	// carrying an authority is refused by the origin check; the userinfo form
+	// is malformed and never resolves to a host at all.
+	tests := map[string]struct{ nextLink, wantErr string }{
+		"absolute URL":       {foreign.URL + "/2/teams/my-team/environments", "refusing to follow"},
+		"protocol relative":  {"//" + foreignHost + "/2/teams/my-team/environments", "refusing to follow"},
+		"userinfo confusion": {"@" + foreignHost + "/2/teams/my-team/environments", "parsing pagination link"},
 	}
 
-	for name, nextLink := range tests {
+	for name, tc := range tests {
 		t.Run(name, func(t *testing.T) {
 			foreignAuth.Store("")
 			// Backstop: an unfixed client can loop when the crafted link
@@ -417,11 +421,11 @@ func TestClient_ListEnvironments_RejectsForeignPaginationLink(t *testing.T) {
 			t.Cleanup(cancel)
 			c, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
 				w.Header().Set("Content-Type", jsonapi.MediaType)
-				_, _ = w.Write([]byte(`{"data": [], "links": {"next": ` + strconv.Quote(nextLink) + `}}`))
+				_, _ = w.Write([]byte(`{"data": [], "links": {"next": ` + strconv.Quote(tc.nextLink) + `}}`))
 			})
 
 			_, err := c.ListEnvironments(ctx)
-			require.Error(t, err, "should refuse to follow a pagination link to another host")
+			assert.ErrorContains(t, err, tc.wantErr)
 			assert.Empty(t, foreignAuth.Load(),
 				"credentials must never be sent to a host other than the configured API")
 		})
@@ -431,6 +435,74 @@ func TestClient_ListEnvironments_RejectsForeignPaginationLink(t *testing.T) {
 // TestClient_ListEnvironments_BoundsPageCount verifies that a server which
 // always advertises another page cannot hold the request in an unbounded fetch
 // loop.
+// TestClient_ListEnvironments_PreservesBasePathPrefix verifies that following
+// a pagination link keeps any path prefix in the configured API URL. Resolving
+// an absolute-path link as a URL reference would discard it, breaking setups
+// that reach Honeycomb through a proxy mounted under a subpath.
+func TestClient_ListEnvironments_PreservesBasePathPrefix(t *testing.T) {
+	ctx := context.Background()
+	var paths []string
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		paths = append(paths, r.URL.Path)
+		w.Header().Set("Content-Type", jsonapi.MediaType)
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/2/auth"):
+			_, _ = w.Write([]byte(authResponse))
+		case r.URL.Query().Get("page") == "":
+			_, _ = w.Write([]byte(`{
+				"data": [{"id": "env1", "type": "environments", "attributes": {"name": "P", "slug": "production"}}],
+				"links": {"next": "/2/teams/my-team/environments?page=2"}
+			}`))
+		default:
+			_, _ = w.Write([]byte(`{
+				"data": [{"id": "env2", "type": "environments", "attributes": {"name": "S", "slug": "staging"}}],
+				"links": {"next": null}
+			}`))
+		}
+	}))
+	t.Cleanup(srv.Close)
+
+	c, err := New(ctx, &Config{BaseURL: srv.URL + "/honeycomb", KeyID: "id", KeySecret: "secret"})
+	require.NoError(t, err)
+
+	envs, err := c.ListEnvironments(ctx)
+	require.NoError(t, err)
+	assert.Len(t, envs, 2, "should follow the next link successfully")
+
+	for _, p := range paths {
+		assert.True(t, strings.HasPrefix(p, "/honeycomb/"),
+			"every request must keep the configured path prefix, got %q", p)
+	}
+}
+
+// TestClient_RefusesRedirectOffOrigin verifies that a redirect cannot move an
+// authenticated request to another origin. Go only strips the Authorization
+// header across domains, so a redirect to a different port, a subdomain, or an
+// https->http downgrade of the same host would otherwise carry the management
+// key along with it.
+func TestClient_RefusesRedirectOffOrigin(t *testing.T) {
+	ctx := context.Background()
+
+	var foreignAuth atomic.Value
+	foreignAuth.Store("")
+	foreign := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		foreignAuth.Store(r.Header.Get("Authorization"))
+		w.Header().Set("Content-Type", jsonapi.MediaType)
+		_, _ = w.Write([]byte(`{"data": [], "links": {"next": null}}`))
+	}))
+	t.Cleanup(foreign.Close)
+
+	c, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, foreign.URL+r.URL.Path, http.StatusFound)
+	})
+
+	_, err := c.ListEnvironments(ctx)
+	assert.Error(t, err, "a redirect off the configured origin should fail")
+	assert.Empty(t, foreignAuth.Load(),
+		"credentials must not follow a redirect to another origin")
+}
+
 func TestClient_ListEnvironments_BoundsPageCount(t *testing.T) {
 	// The deadline is a backstop only: a correct implementation stops on its
 	// own after maxPaginationPages, long before this fires.
@@ -448,8 +520,9 @@ func TestClient_ListEnvironments_BoundsPageCount(t *testing.T) {
 	})
 
 	_, err := c.ListEnvironments(ctx)
-	require.Error(t, err, "should stop and error rather than follow pages forever")
-	require.NotErrorIs(t, err, context.DeadlineExceeded,
+	assert.ErrorContains(t, err, "exceeded",
+		"should stop on the page cap, not for an incidental reason")
+	assert.NotErrorIs(t, err, context.DeadlineExceeded,
 		"should terminate on its own, not by exhausting the request deadline")
 	assert.Less(t, pages.Load(), int32(1000), "page fetches should be bounded")
 }

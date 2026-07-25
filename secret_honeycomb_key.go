@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/hashicorp/vault/sdk/framework"
 	"github.com/hashicorp/vault/sdk/logical"
@@ -11,7 +12,12 @@ import (
 	"github.com/jharley/vault-plugin-secrets-honeycombio/internal/client"
 )
 
-const secretKeyType = "honeycomb_key"
+const (
+	secretKeyType = "honeycomb_key"
+
+	// revokeClientTimeout bounds the client setup performed during revocation.
+	revokeClientTimeout = 10 * time.Second
+)
 
 func secretHoneycombKey(b *honeycombBackend) *framework.Secret {
 	return &framework.Secret{
@@ -48,12 +54,26 @@ func (b *honeycombBackend) secretKeyRevoke(ctx context.Context, req *logical.Req
 		return nil, fmt.Errorf("key_id not found in secret internal data")
 	}
 
-	c, err := b.getClient(ctx, req.Storage)
+	// Building the client calls /2/auth, which retries on failure. Bound it so
+	// a Honeycomb outage cannot occupy an expiration worker for the whole
+	// retry schedule; Vault retries the revocation itself, with better
+	// backoff than blocking here would give.
+	clientCtx, cancel := context.WithTimeout(ctx, revokeClientTimeout)
+	defer cancel()
+
+	c, err := b.getClient(clientCtx, req.Storage)
 	if err != nil {
-		// If we can't create a client (e.g., config deleted), we can't revoke
-		// the key via the API. Warn and let the lease expire rather than
-		// retrying indefinitely.
-		b.Logger().Error("cannot revoke API key: client unavailable", "key_id", keyID, "error", err)
+		// A Honeycomb outage fails here on any cold path (after a config
+		// write, plugin reload or restart). That is transient and must be
+		// retried, or the lease is dropped while the key is still live.
+		if isRetryableRevokeError(err) {
+			b.Logger().Error("cannot revoke API key: client unavailable, will retry", "key_id", keyID, "error", err)
+			return nil, fmt.Errorf("building client to revoke Honeycomb API key %s: %w", keyID, err)
+		}
+
+		// The configuration is gone or unusable. No amount of retrying will
+		// fix that, so warn and let the lease expire.
+		b.Logger().Error("cannot revoke API key: client unavailable, giving up", "key_id", keyID, "error", err)
 		return &logical.Response{
 			Warnings: []string{fmt.Sprintf("failed to revoke Honeycomb API key %s: %s", keyID, err)},
 		}, nil
@@ -83,9 +103,16 @@ func (b *honeycombBackend) secretKeyRevoke(ctx context.Context, req *logical.Req
 }
 
 // isRetryableRevokeError reports whether a revocation failure is worth
-// retrying. Transport-level failures carry no status code and are always
-// treated as transient.
+// retrying. Anything caused by the backend's own configuration is permanent;
+// transport-level failures carry no status code and are treated as transient.
 func isRetryableRevokeError(err error) bool {
+	if errors.Is(err, errNotConfigured) {
+		return false
+	}
+	var invalidCfg *invalidConfigError
+	if errors.As(err, &invalidCfg) {
+		return false
+	}
 	var apiErr *client.APIError
 	if errors.As(err, &apiErr) {
 		return apiErr.Retryable()
