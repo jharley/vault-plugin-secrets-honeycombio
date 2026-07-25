@@ -254,6 +254,10 @@ func (b *honeycombBackend) pathRoleWrite(ctx context.Context, req *logical.Reque
 		role.MaxTTL = time.Duration(v.(int)) * time.Second //nolint:durationcheck,forcetypeassert
 	}
 
+	if role.MaxTTL > 0 && role.TTL > role.MaxTTL {
+		return logical.ErrorResponse("ttl (%s) cannot exceed max_ttl (%s)", role.TTL, role.MaxTTL), nil
+	}
+
 	entry, err := logical.StorageEntryJSON(roleStoragePrefix+name, role)
 	if err != nil {
 		return nil, err

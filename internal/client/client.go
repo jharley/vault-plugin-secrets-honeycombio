@@ -4,14 +4,17 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"math/rand/v2"
 	"net/http"
+	"net/url"
 	"reflect"
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/hashicorp/go-hclog"
 	"github.com/hashicorp/go-retryablehttp"
@@ -26,7 +29,39 @@ const (
 	// maxErrorBodySize is the maximum number of bytes read from error
 	// response bodies for inclusion in error messages.
 	maxErrorBodySize = 8192
+
+	// maxResponseBodySize bounds how much of a successful response body is
+	// buffered. A team with tens of thousands of environments stays well
+	// under this; anything larger is treated as a malformed or hostile
+	// response rather than being read into memory.
+	maxResponseBodySize = 10 << 20 // 10 MiB
+
+	// maxPaginationPages bounds how many pages a single paginated call will
+	// follow, so a server that always advertises another page cannot hold the
+	// request in an unbounded fetch loop.
+	maxPaginationPages = 100
+
+	// maxRateLimitReset bounds the reset window accepted from a server before
+	// it is converted to a Duration, so an absurd value cannot overflow the
+	// int64 nanosecond representation.
+	maxRateLimitReset = 24 * time.Hour
+
+	// maxRedirects bounds redirect chains within the configured origin.
+	maxRedirects = 5
+
+	// backoffJitterDivisor sets how much jitter is added to a rate-limit
+	// backoff, as a fraction of the wait itself (wait/4, so up to +25%).
+	backoffJitterDivisor = 4
+
+	// maxErrorDetailLength bounds how much server-supplied text is carried in
+	// an APIError. The detail reaches Vault lease warnings and the audit log,
+	// so it is kept short rather than echoing an arbitrary response body.
+	maxErrorDetailLength = 512
 )
+
+// errRedirectRefused marks a redirect rejected by policy. It is deterministic,
+// so retrying cannot help.
+var errRedirectRefused = errors.New("refusing to follow redirect")
 
 // Config holds the connection parameters for a Honeycomb API client.
 type Config struct {
@@ -47,6 +82,7 @@ type Config struct {
 // Client is a minimal Honeycomb v2 Management API client.
 type Client struct {
 	baseURL   string
+	base      *url.URL
 	keyID     string
 	keySecret string
 	teamSlug  string
@@ -67,8 +103,18 @@ func New(ctx context.Context, cfg *Config) (*Client, error) {
 		return nil, fmt.Errorf("KeySecret is required")
 	}
 
+	trimmed := strings.TrimRight(cfg.BaseURL, "/")
+	base, err := url.Parse(trimmed)
+	if err != nil {
+		return nil, fmt.Errorf("parsing BaseURL: %w", err)
+	}
+	if base.Host == "" {
+		return nil, fmt.Errorf("BaseURL %q has no host", cfg.BaseURL)
+	}
+
 	c := &Client{
-		baseURL:   strings.TrimRight(cfg.BaseURL, "/"),
+		baseURL:   trimmed,
+		base:      base,
 		keyID:     cfg.KeyID,
 		keySecret: cfg.KeySecret,
 	}
@@ -81,7 +127,7 @@ func New(ctx context.Context, cfg *Config) (*Client, error) {
 		Backoff:      c.retryBackoff,
 		CheckRetry:   c.retryCheck,
 		ErrorHandler: retryablehttp.PassthroughErrorHandler,
-		HTTPClient:   &http.Client{Timeout: 30 * time.Second},
+		HTTPClient:   &http.Client{Timeout: 30 * time.Second, CheckRedirect: c.checkRedirect},
 		Logger:       logger.Named("honeycomb.http"),
 		RetryWaitMin: defaultRetryWaitMin,
 		RetryWaitMax: defaultRetryWaitMax,
@@ -127,6 +173,9 @@ func (c *Client) retryCheck(ctx context.Context, resp *http.Response, err error)
 	if ctx.Err() != nil {
 		return false, ctx.Err()
 	}
+	if errors.Is(err, errRedirectRefused) {
+		return false, err
+	}
 	if err != nil {
 		return true, err
 	}
@@ -150,22 +199,20 @@ func (c *Client) retryBackoff(minWait, maxWait time.Duration, attemptNum int, re
 
 // rateLimitBackoff extracts the backoff duration from rate-limit headers.
 // Parses the Ratelimit header (format: "limit=X, remaining=Y, reset=Z")
-// and falls back to Retry-After header. The returned duration may exceed
-// maxWait when the server's reset window is large — this is intentional
-// to respect the server's rate-limit window.
+// and falls back to Retry-After header.
+//
+// The server's reset window is honoured only up to maxWait. Waiting longer
+// than that inside a single request is pointless — the caller's context
+// expires first — and an unbounded value lets a hostile or malfunctioning
+// server stall the request for as long as it likes.
 func (c *Client) rateLimitBackoff(minWait, maxWait time.Duration, resp *http.Response) time.Duration {
-	var jitter time.Duration
-	if maxWait > minWait {
-		jitter = time.Duration(rand.Int64N(int64(maxWait - minWait)))
-	}
-
 	var reset time.Duration
 	if rl := resp.Header.Get("Ratelimit"); rl != "" {
 		for _, part := range strings.Split(rl, ",") {
 			part = strings.TrimSpace(part)
 			if strings.HasPrefix(part, "reset=") {
 				if seconds, err := strconv.Atoi(strings.TrimPrefix(part, "reset=")); err == nil && seconds > 0 {
-					reset = time.Duration(seconds) * time.Second
+					reset = secondsToDuration(seconds)
 				}
 			}
 		}
@@ -174,27 +221,73 @@ func (c *Client) rateLimitBackoff(minWait, maxWait time.Duration, resp *http.Res
 	if reset == 0 {
 		if ra := resp.Header.Get("Retry-After"); ra != "" {
 			if seconds, err := strconv.Atoi(ra); err == nil && seconds > 0 {
-				reset = time.Duration(seconds) * time.Second
+				reset = secondsToDuration(seconds)
 			} else if t, err := http.ParseTime(ra); err == nil {
 				if d := time.Until(t); d > 0 {
-					reset = d
+					reset = min(d, maxRateLimitReset)
 				}
 			}
 		}
 	}
 
-	if reset > minWait {
-		minWait = reset
+	wait := minWait
+	if reset > wait {
+		wait = reset
 	}
-	return minWait + jitter
+
+	// Jitter spreads out clients that would otherwise all retry the instant
+	// the window closes. It is a fraction of the wait rather than a draw
+	// across the whole retry range, so a short window stays short — drawing
+	// against maxWait turned a one second reset into a ~16 second wait.
+	if spread := int64(wait) / backoffJitterDivisor; spread > 0 {
+		wait += time.Duration(rand.Int64N(spread))
+	}
+
+	return min(wait, maxWait)
 }
 
-// apiError parses a JSON:API error response and returns a formatted error.
+// secondsToDuration converts a server-supplied second count to a Duration,
+// clamping first so an implausibly large value cannot overflow int64
+// nanoseconds and wrap to a negative or nonsensical wait.
+func secondsToDuration(seconds int) time.Duration {
+	if seconds > int(maxRateLimitReset/time.Second) {
+		return maxRateLimitReset
+	}
+	return time.Duration(seconds) * time.Second
+}
+
+// APIError is returned for a non-success HTTP response. Callers can inspect
+// StatusCode with errors.As to decide whether a failure is worth retrying.
+type APIError struct {
+	StatusCode int
+	Detail     string
+}
+
+func (e *APIError) Error() string {
+	if e.Detail == "" {
+		return fmt.Sprintf("status %d", e.StatusCode)
+	}
+	return fmt.Sprintf("status %d: %s", e.StatusCode, e.Detail)
+}
+
+// Retryable reports whether the failure may succeed on a later attempt.
+// Server-side failures, timeouts and rate limiting are transient; other 4xx
+// responses indicate a request that will fail identically every time.
+func (e *APIError) Retryable() bool {
+	switch e.StatusCode {
+	case http.StatusRequestTimeout, http.StatusTooManyRequests:
+		return true
+	default:
+		return e.StatusCode >= 500
+	}
+}
+
+// apiError parses a JSON:API error response and returns an *APIError.
 // Falls back to the raw body if the response is not valid JSON:API.
 func apiError(resp *http.Response) error {
 	body, err := io.ReadAll(io.LimitReader(resp.Body, maxErrorBodySize))
 	if err != nil || len(body) == 0 {
-		return fmt.Errorf("status %d", resp.StatusCode)
+		return &APIError{StatusCode: resp.StatusCode}
 	}
 
 	var payload jsonapi.ErrorsPayload
@@ -207,10 +300,30 @@ func apiError(resp *http.Response) error {
 				messages[i] = e.Title
 			}
 		}
-		return fmt.Errorf("status %d: %s", resp.StatusCode, strings.Join(messages, "; "))
+		return &APIError{StatusCode: resp.StatusCode, Detail: truncateDetail(strings.Join(messages, "; "))}
 	}
 
-	return fmt.Errorf("status %d: %s", resp.StatusCode, string(body))
+	return &APIError{StatusCode: resp.StatusCode, Detail: truncateDetail(string(body))}
+}
+
+// truncateDetail bounds server-supplied error text. It surfaces in Vault lease
+// warnings and the audit log, so an arbitrary response body is not echoed
+// wholesale.
+func truncateDetail(s string) string {
+	s = strings.Map(func(r rune) rune {
+		if r == '\n' || r == '\t' {
+			return ' '
+		}
+		if unicode.IsControl(r) {
+			return -1
+		}
+		return r
+	}, strings.TrimSpace(s))
+
+	if len(s) > maxErrorDetailLength {
+		return s[:maxErrorDetailLength] + "… (truncated)"
+	}
+	return s
 }
 
 // AuthResponse contains metadata about the management API key.
@@ -312,8 +425,13 @@ func (c *Client) Auth(ctx context.Context) (*AuthResponse, error) {
 		return nil, fmt.Errorf("auth request: %w", apiError(resp))
 	}
 
+	body, err := readLimited(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("reading auth response: %w", err)
+	}
+
 	result := new(authKey)
-	if err := jsonapi.UnmarshalPayload(resp.Body, result); err != nil {
+	if err := jsonapi.UnmarshalPayload(bytes.NewReader(body), result); err != nil {
 		return nil, fmt.Errorf("decoding auth response: %w", err)
 	}
 
@@ -336,9 +454,13 @@ func (c *Client) Auth(ctx context.Context) (*AuthResponse, error) {
 // Follows cursor-based pagination to retrieve all pages.
 func (c *Client) ListEnvironments(ctx context.Context) ([]Environment, error) {
 	var allEnvs []Environment
-	endpoint := c.baseURL + "/2/teams/" + c.teamSlug + "/environments"
+	endpoint := c.baseURL + "/2/teams/" + url.PathEscape(c.teamSlug) + "/environments"
 
-	for {
+	for page := 0; ; page++ {
+		if page >= maxPaginationPages {
+			return nil, fmt.Errorf("listing environments exceeded %d pages", maxPaginationPages)
+		}
+
 		req, err := retryablehttp.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 		if err != nil {
 			return nil, fmt.Errorf("creating list environments request: %w", err)
@@ -356,7 +478,7 @@ func (c *Client) ListEnvironments(ctx context.Context) ([]Environment, error) {
 		}
 
 		// Read the full body so we can decode both data and pagination links.
-		body, err := io.ReadAll(resp.Body)
+		body, err := readLimited(resp.Body)
 		resp.Body.Close()
 		if err != nil {
 			return nil, fmt.Errorf("reading environments response: %w", err)
@@ -372,20 +494,81 @@ func (c *Client) ListEnvironments(ctx context.Context) ([]Environment, error) {
 		}
 
 		// Check for next page via the links object.
-		var page struct {
+		var links struct {
 			Links *paginationLinks `json:"links"`
 		}
-		if err := json.Unmarshal(body, &page); err != nil {
+		if err := json.Unmarshal(body, &links); err != nil {
 			return nil, fmt.Errorf("decoding pagination links: %w", err)
 		}
 
-		if page.Links == nil || page.Links.Next == "" {
+		if links.Links == nil || links.Links.Next == "" {
 			break
 		}
-		endpoint = c.baseURL + page.Links.Next
+
+		next, err := c.resolveAPIURL(links.Links.Next)
+		if err != nil {
+			return nil, err
+		}
+		endpoint = next
 	}
 
 	return allEnvs, nil
+}
+
+// resolveAPIURL turns a server-supplied link into a request URL, refusing
+// anything that would leave the configured API origin. Without this check a
+// link such as "@evil.example/path" reparses the base URL as a userinfo
+// component, sending the management key to another host.
+func (c *Client) resolveAPIURL(link string) (string, error) {
+	ref, err := url.Parse(link)
+	if err != nil {
+		return "", fmt.Errorf("parsing pagination link %q: %w", link, err)
+	}
+
+	// A link carrying its own scheme or authority must match the configured
+	// origin exactly.
+	if ref.Scheme != "" || ref.Host != "" {
+		if ref.Scheme != c.base.Scheme || ref.Host != c.base.Host {
+			return "", fmt.Errorf("refusing to follow pagination link %q: resolves to %s://%s, expected %s://%s",
+				link, ref.Scheme, ref.Host, c.base.Scheme, c.base.Host)
+		}
+		ref.User = nil // never echo credentials from a server-supplied link
+		return ref.String(), nil
+	}
+
+	// A path-only link is re-anchored on the configured base URL rather than
+	// resolved as a URL reference, so that a base with a path prefix (an API
+	// reached through a proxy mounted under a subpath) keeps that prefix.
+	return c.baseURL + "/" + strings.TrimPrefix(ref.String(), "/"), nil
+}
+
+// checkRedirect refuses any redirect that leaves the configured API origin.
+// Go strips the Authorization header only across domains, so a redirect to a
+// different port, to a subdomain, or downgrading https to http on the same
+// host would otherwise carry the management key along with it.
+func (c *Client) checkRedirect(req *http.Request, via []*http.Request) error {
+	if len(via) >= maxRedirects {
+		return fmt.Errorf("%w: stopped after %d redirects", errRedirectRefused, maxRedirects)
+	}
+	if req.URL.Scheme != c.base.Scheme || req.URL.Host != c.base.Host {
+		return fmt.Errorf("%w to %s://%s, expected %s://%s",
+			errRedirectRefused, req.URL.Scheme, req.URL.Host, c.base.Scheme, c.base.Host)
+	}
+	return nil
+}
+
+// readLimited reads r into memory, refusing bodies larger than
+// maxResponseBodySize so a hostile or malfunctioning server cannot exhaust
+// process memory.
+func readLimited(r io.Reader) ([]byte, error) {
+	body, err := io.ReadAll(io.LimitReader(r, maxResponseBodySize+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(body) > maxResponseBodySize {
+		return nil, fmt.Errorf("response body too large (exceeds %d bytes)", maxResponseBodySize)
+	}
+	return body, nil
 }
 
 // CreateAPIKey creates a new API key in the given team.
@@ -402,7 +585,7 @@ func (c *Client) CreateAPIKey(ctx context.Context, input *CreateAPIKeyRequest) (
 		return nil, fmt.Errorf("marshaling create API key request: %w", err)
 	}
 
-	req, err := retryablehttp.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/2/teams/"+c.teamSlug+"/api-keys", &buf)
+	req, err := retryablehttp.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/2/teams/"+url.PathEscape(c.teamSlug)+"/api-keys", &buf)
 	if err != nil {
 		return nil, fmt.Errorf("creating API key request: %w", err)
 	}
@@ -417,9 +600,17 @@ func (c *Client) CreateAPIKey(ctx context.Context, input *CreateAPIKeyRequest) (
 		return nil, fmt.Errorf("create API key: %w", apiError(resp))
 	}
 
+	body, err := readLimited(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("reading create API key response: %w", err)
+	}
+
 	result := new(apiKey)
-	if err := jsonapi.UnmarshalPayload(resp.Body, result); err != nil {
+	if err := jsonapi.UnmarshalPayload(bytes.NewReader(body), result); err != nil {
 		return nil, fmt.Errorf("decoding create API key response: %w", err)
+	}
+	if result.ID == "" {
+		return nil, fmt.Errorf("create API key: response contained no key ID")
 	}
 
 	return &APIKeyResponse{
@@ -432,7 +623,7 @@ func (c *Client) CreateAPIKey(ctx context.Context, input *CreateAPIKeyRequest) (
 
 // DeleteAPIKey deletes an API key. Treats 404 as success (idempotent).
 func (c *Client) DeleteAPIKey(ctx context.Context, keyID string) error {
-	req, err := retryablehttp.NewRequestWithContext(ctx, http.MethodDelete, c.baseURL+"/2/teams/"+c.teamSlug+"/api-keys/"+keyID, nil)
+	req, err := retryablehttp.NewRequestWithContext(ctx, http.MethodDelete, c.baseURL+"/2/teams/"+url.PathEscape(c.teamSlug)+"/api-keys/"+url.PathEscape(keyID), nil)
 	if err != nil {
 		return fmt.Errorf("creating delete API key request: %w", err)
 	}
@@ -443,7 +634,7 @@ func (c *Client) DeleteAPIKey(ctx context.Context, keyID string) error {
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusNoContent && resp.StatusCode != http.StatusNotFound {
+	if resp.StatusCode/100 != 2 && resp.StatusCode != http.StatusNotFound {
 		return fmt.Errorf("delete API key: %w", apiError(resp))
 	}
 

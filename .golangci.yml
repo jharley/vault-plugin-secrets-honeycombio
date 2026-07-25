@@ -22,6 +22,12 @@ linters:
     - unused
     - usetesting
   settings:
+    testifylint:
+      # require is reserved for preconditions that make the rest of a test
+      # meaningless (setup failures, nil checks before a dereference).
+      # Ordinary error assertions use assert so a run reports every failure.
+      disable:
+        - require-error
     usetesting:
       context-background: false
       context-todo: true
