@@ -1,13 +1,17 @@
 package client
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
+	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/hashicorp/jsonapi"
 	"github.com/stretchr/testify/assert"
@@ -380,6 +384,124 @@ func TestClient_ListEnvironments_Pagination(t *testing.T) {
 	assert.Equal(t, "env2", envs[1].ID)
 	assert.Equal(t, "env3", envs[2].ID)
 	assert.Equal(t, 2, page, "should have made 2 requests")
+}
+
+// TestClient_ListEnvironments_RejectsForeignPaginationLink verifies that a
+// server-supplied "next" link cannot redirect an authenticated request to a
+// different host. Concatenating the link onto the base URL allows a value such
+// as "@evil.example" to reparse the base URL as a userinfo component, sending
+// the management key to an attacker-controlled host.
+func TestClient_ListEnvironments_RejectsForeignPaginationLink(t *testing.T) {
+	var foreignAuth atomic.Value
+	foreignAuth.Store("")
+	foreign := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		foreignAuth.Store(r.Header.Get("Authorization"))
+		w.Header().Set("Content-Type", jsonapi.MediaType)
+		_, _ = w.Write([]byte(`{"data": [], "links": {"next": null}}`))
+	}))
+	t.Cleanup(foreign.Close)
+	foreignHost := strings.TrimPrefix(foreign.URL, "http://")
+
+	tests := map[string]string{
+		"userinfo confusion": "@" + foreignHost + "/2/teams/my-team/environments",
+		"absolute URL":       foreign.URL + "/2/teams/my-team/environments",
+		"protocol relative":  "//" + foreignHost + "/2/teams/my-team/environments",
+	}
+
+	for name, nextLink := range tests {
+		t.Run(name, func(t *testing.T) {
+			foreignAuth.Store("")
+			// Backstop: an unfixed client can loop when the crafted link
+			// resolves back onto the base host.
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			t.Cleanup(cancel)
+			c, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", jsonapi.MediaType)
+				_, _ = w.Write([]byte(`{"data": [], "links": {"next": ` + strconv.Quote(nextLink) + `}}`))
+			})
+
+			_, err := c.ListEnvironments(ctx)
+			require.Error(t, err, "should refuse to follow a pagination link to another host")
+			assert.Empty(t, foreignAuth.Load(),
+				"credentials must never be sent to a host other than the configured API")
+		})
+	}
+}
+
+// TestClient_ListEnvironments_BoundsPageCount verifies that a server which
+// always advertises another page cannot hold the request in an unbounded fetch
+// loop.
+func TestClient_ListEnvironments_BoundsPageCount(t *testing.T) {
+	// The deadline is a backstop only: a correct implementation stops on its
+	// own after maxPaginationPages, long before this fires.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	t.Cleanup(cancel)
+
+	var pages atomic.Int32
+	c, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		pages.Add(1)
+		w.Header().Set("Content-Type", jsonapi.MediaType)
+		_, _ = w.Write([]byte(`{
+			"data": [{"id": "env1", "type": "environments", "attributes": {"name": "E", "slug": "e"}}],
+			"links": {"next": "/2/teams/my-team/environments?page=next"}
+		}`))
+	})
+
+	_, err := c.ListEnvironments(ctx)
+	require.Error(t, err, "should stop and error rather than follow pages forever")
+	require.NotErrorIs(t, err, context.DeadlineExceeded,
+		"should terminate on its own, not by exhausting the request deadline")
+	assert.Less(t, pages.Load(), int32(1000), "page fetches should be bounded")
+}
+
+// TestClient_ListEnvironments_RejectsOversizedResponse verifies that an
+// oversized response body is rejected rather than read entirely into memory.
+func TestClient_ListEnvironments_RejectsOversizedResponse(t *testing.T) {
+	ctx := context.Background()
+	c, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", jsonapi.MediaType)
+		_, _ = w.Write([]byte(`{"data": [], "links": {"next": null}, "pad": "`))
+		chunk := bytes.Repeat([]byte("A"), 1<<20)
+		for range (maxResponseBodySize >> 20) + 2 {
+			_, _ = w.Write(chunk)
+		}
+		_, _ = w.Write([]byte(`"}`))
+	})
+
+	_, err := c.ListEnvironments(ctx)
+	require.Error(t, err, "oversized response bodies should be rejected")
+	assert.Contains(t, err.Error(), "too large")
+}
+
+func TestClient_RateLimitBackoff_CapsServerSuppliedReset(t *testing.T) {
+	c := &Client{}
+	minWait, maxWait := 500*time.Millisecond, 30*time.Second
+
+	tests := map[string]string{
+		"one day":            "reset=86400",
+		"implausibly large":  "reset=999999999",
+		"overflows int64 ns": "reset=99999999999999",
+	}
+
+	for name, header := range tests {
+		t.Run(name, func(t *testing.T) {
+			resp := &http.Response{StatusCode: http.StatusTooManyRequests, Header: http.Header{}}
+			resp.Header.Set("Ratelimit", "limit=100, remaining=0, "+header)
+
+			got := c.rateLimitBackoff(minWait, maxWait, resp)
+			assert.Positive(t, got, "backoff must never be zero or negative")
+			assert.LessOrEqual(t, got, 2*maxWait, "backoff must stay bounded by maxWait plus jitter")
+		})
+	}
+}
+
+func TestClient_RateLimitBackoff_HonoursShortReset(t *testing.T) {
+	c := &Client{}
+	resp := &http.Response{StatusCode: http.StatusTooManyRequests, Header: http.Header{}}
+	resp.Header.Set("Ratelimit", "limit=100, remaining=0, reset=5")
+
+	got := c.rateLimitBackoff(500*time.Millisecond, 30*time.Second, resp)
+	assert.GreaterOrEqual(t, got, 5*time.Second, "a reset within bounds should still be honoured")
 }
 
 func TestClient_CreateAPIKey(t *testing.T) {

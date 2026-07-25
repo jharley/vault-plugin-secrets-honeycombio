@@ -8,6 +8,7 @@ import (
 	"io"
 	"math/rand/v2"
 	"net/http"
+	"net/url"
 	"reflect"
 	"strconv"
 	"strings"
@@ -26,6 +27,22 @@ const (
 	// maxErrorBodySize is the maximum number of bytes read from error
 	// response bodies for inclusion in error messages.
 	maxErrorBodySize = 8192
+
+	// maxResponseBodySize bounds how much of a successful response body is
+	// buffered. A team with tens of thousands of environments stays well
+	// under this; anything larger is treated as a malformed or hostile
+	// response rather than being read into memory.
+	maxResponseBodySize = 10 << 20 // 10 MiB
+
+	// maxPaginationPages bounds how many pages a single paginated call will
+	// follow, so a server that always advertises another page cannot hold the
+	// request in an unbounded fetch loop.
+	maxPaginationPages = 100
+
+	// maxRateLimitReset bounds the reset window accepted from a server before
+	// it is converted to a Duration, so an absurd value cannot overflow the
+	// int64 nanosecond representation.
+	maxRateLimitReset = 24 * time.Hour
 )
 
 // Config holds the connection parameters for a Honeycomb API client.
@@ -47,6 +64,7 @@ type Config struct {
 // Client is a minimal Honeycomb v2 Management API client.
 type Client struct {
 	baseURL   string
+	base      *url.URL
 	keyID     string
 	keySecret string
 	teamSlug  string
@@ -67,8 +85,18 @@ func New(ctx context.Context, cfg *Config) (*Client, error) {
 		return nil, fmt.Errorf("KeySecret is required")
 	}
 
+	trimmed := strings.TrimRight(cfg.BaseURL, "/")
+	base, err := url.Parse(trimmed)
+	if err != nil {
+		return nil, fmt.Errorf("parsing BaseURL: %w", err)
+	}
+	if base.Host == "" {
+		return nil, fmt.Errorf("BaseURL %q has no host", cfg.BaseURL)
+	}
+
 	c := &Client{
-		baseURL:   strings.TrimRight(cfg.BaseURL, "/"),
+		baseURL:   trimmed,
+		base:      base,
 		keyID:     cfg.KeyID,
 		keySecret: cfg.KeySecret,
 	}
@@ -150,9 +178,12 @@ func (c *Client) retryBackoff(minWait, maxWait time.Duration, attemptNum int, re
 
 // rateLimitBackoff extracts the backoff duration from rate-limit headers.
 // Parses the Ratelimit header (format: "limit=X, remaining=Y, reset=Z")
-// and falls back to Retry-After header. The returned duration may exceed
-// maxWait when the server's reset window is large — this is intentional
-// to respect the server's rate-limit window.
+// and falls back to Retry-After header.
+//
+// The server's reset window is honoured only up to maxWait. Waiting longer
+// than that inside a single request is pointless — the caller's context
+// expires first — and an unbounded value lets a hostile or malfunctioning
+// server stall the request for as long as it likes.
 func (c *Client) rateLimitBackoff(minWait, maxWait time.Duration, resp *http.Response) time.Duration {
 	var jitter time.Duration
 	if maxWait > minWait {
@@ -165,7 +196,7 @@ func (c *Client) rateLimitBackoff(minWait, maxWait time.Duration, resp *http.Res
 			part = strings.TrimSpace(part)
 			if strings.HasPrefix(part, "reset=") {
 				if seconds, err := strconv.Atoi(strings.TrimPrefix(part, "reset=")); err == nil && seconds > 0 {
-					reset = time.Duration(seconds) * time.Second
+					reset = secondsToDuration(seconds)
 				}
 			}
 		}
@@ -174,10 +205,10 @@ func (c *Client) rateLimitBackoff(minWait, maxWait time.Duration, resp *http.Res
 	if reset == 0 {
 		if ra := resp.Header.Get("Retry-After"); ra != "" {
 			if seconds, err := strconv.Atoi(ra); err == nil && seconds > 0 {
-				reset = time.Duration(seconds) * time.Second
+				reset = secondsToDuration(seconds)
 			} else if t, err := http.ParseTime(ra); err == nil {
 				if d := time.Until(t); d > 0 {
-					reset = d
+					reset = min(d, maxRateLimitReset)
 				}
 			}
 		}
@@ -186,15 +217,54 @@ func (c *Client) rateLimitBackoff(minWait, maxWait time.Duration, resp *http.Res
 	if reset > minWait {
 		minWait = reset
 	}
+	if minWait > maxWait {
+		minWait = maxWait
+	}
 	return minWait + jitter
 }
 
-// apiError parses a JSON:API error response and returns a formatted error.
+// secondsToDuration converts a server-supplied second count to a Duration,
+// clamping first so an implausibly large value cannot overflow int64
+// nanoseconds and wrap to a negative or nonsensical wait.
+func secondsToDuration(seconds int) time.Duration {
+	if seconds > int(maxRateLimitReset/time.Second) {
+		return maxRateLimitReset
+	}
+	return time.Duration(seconds) * time.Second
+}
+
+// APIError is returned for a non-success HTTP response. Callers can inspect
+// StatusCode with errors.As to decide whether a failure is worth retrying.
+type APIError struct {
+	StatusCode int
+	Detail     string
+}
+
+func (e *APIError) Error() string {
+	if e.Detail == "" {
+		return fmt.Sprintf("status %d", e.StatusCode)
+	}
+	return fmt.Sprintf("status %d: %s", e.StatusCode, e.Detail)
+}
+
+// Retryable reports whether the failure may succeed on a later attempt.
+// Server-side failures, timeouts and rate limiting are transient; other 4xx
+// responses indicate a request that will fail identically every time.
+func (e *APIError) Retryable() bool {
+	switch e.StatusCode {
+	case http.StatusRequestTimeout, http.StatusTooManyRequests:
+		return true
+	default:
+		return e.StatusCode >= 500
+	}
+}
+
+// apiError parses a JSON:API error response and returns an *APIError.
 // Falls back to the raw body if the response is not valid JSON:API.
 func apiError(resp *http.Response) error {
 	body, err := io.ReadAll(io.LimitReader(resp.Body, maxErrorBodySize))
 	if err != nil || len(body) == 0 {
-		return fmt.Errorf("status %d", resp.StatusCode)
+		return &APIError{StatusCode: resp.StatusCode}
 	}
 
 	var payload jsonapi.ErrorsPayload
@@ -207,10 +277,10 @@ func apiError(resp *http.Response) error {
 				messages[i] = e.Title
 			}
 		}
-		return fmt.Errorf("status %d: %s", resp.StatusCode, strings.Join(messages, "; "))
+		return &APIError{StatusCode: resp.StatusCode, Detail: strings.Join(messages, "; ")}
 	}
 
-	return fmt.Errorf("status %d: %s", resp.StatusCode, string(body))
+	return &APIError{StatusCode: resp.StatusCode, Detail: string(body)}
 }
 
 // AuthResponse contains metadata about the management API key.
@@ -338,7 +408,11 @@ func (c *Client) ListEnvironments(ctx context.Context) ([]Environment, error) {
 	var allEnvs []Environment
 	endpoint := c.baseURL + "/2/teams/" + c.teamSlug + "/environments"
 
-	for {
+	for page := 0; ; page++ {
+		if page >= maxPaginationPages {
+			return nil, fmt.Errorf("listing environments exceeded %d pages", maxPaginationPages)
+		}
+
 		req, err := retryablehttp.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 		if err != nil {
 			return nil, fmt.Errorf("creating list environments request: %w", err)
@@ -356,7 +430,7 @@ func (c *Client) ListEnvironments(ctx context.Context) ([]Environment, error) {
 		}
 
 		// Read the full body so we can decode both data and pagination links.
-		body, err := io.ReadAll(resp.Body)
+		body, err := readLimited(resp.Body)
 		resp.Body.Close()
 		if err != nil {
 			return nil, fmt.Errorf("reading environments response: %w", err)
@@ -372,20 +446,55 @@ func (c *Client) ListEnvironments(ctx context.Context) ([]Environment, error) {
 		}
 
 		// Check for next page via the links object.
-		var page struct {
+		var links struct {
 			Links *paginationLinks `json:"links"`
 		}
-		if err := json.Unmarshal(body, &page); err != nil {
+		if err := json.Unmarshal(body, &links); err != nil {
 			return nil, fmt.Errorf("decoding pagination links: %w", err)
 		}
 
-		if page.Links == nil || page.Links.Next == "" {
+		if links.Links == nil || links.Links.Next == "" {
 			break
 		}
-		endpoint = c.baseURL + page.Links.Next
+
+		next, err := c.resolveAPIURL(links.Links.Next)
+		if err != nil {
+			return nil, err
+		}
+		endpoint = next
 	}
 
 	return allEnvs, nil
+}
+
+// resolveAPIURL resolves a server-supplied link against the configured base
+// URL and rejects anything that would leave the configured API origin.
+// Without this check a link such as "@evil.example/path" reparses the base URL
+// as a userinfo component, sending the management key to another host.
+func (c *Client) resolveAPIURL(link string) (string, error) {
+	ref, err := c.base.Parse(link)
+	if err != nil {
+		return "", fmt.Errorf("parsing pagination link %q: %w", link, err)
+	}
+	if ref.Scheme != c.base.Scheme || ref.Host != c.base.Host {
+		return "", fmt.Errorf("refusing to follow pagination link %q: resolves to %s://%s, expected %s://%s",
+			link, ref.Scheme, ref.Host, c.base.Scheme, c.base.Host)
+	}
+	return ref.String(), nil
+}
+
+// readLimited reads r into memory, refusing bodies larger than
+// maxResponseBodySize so a hostile or malfunctioning server cannot exhaust
+// process memory.
+func readLimited(r io.Reader) ([]byte, error) {
+	body, err := io.ReadAll(io.LimitReader(r, maxResponseBodySize+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(body) > maxResponseBodySize {
+		return nil, fmt.Errorf("response body too large (exceeds %d bytes)", maxResponseBodySize)
+	}
+	return body, nil
 }
 
 // CreateAPIKey creates a new API key in the given team.
