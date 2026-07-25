@@ -568,6 +568,29 @@ func TestClient_RateLimitBackoff_CapsServerSuppliedReset(t *testing.T) {
 	}
 }
 
+// TestClient_RateLimitBackoff_StaysProportionalToReset verifies that jitter
+// scales with the wait rather than being drawn across the whole retry range.
+// A server asking for a one second window should get roughly one second, not
+// a wait dominated by jitter sized against maxWait.
+func TestClient_RateLimitBackoff_StaysProportionalToReset(t *testing.T) {
+	c := &Client{}
+	minWait, maxWait := 500*time.Millisecond, 30*time.Second
+
+	for _, want := range []time.Duration{time.Second, 2 * time.Second, 10 * time.Second} {
+		t.Run(want.String(), func(t *testing.T) {
+			resp := &http.Response{StatusCode: http.StatusTooManyRequests, Header: http.Header{}}
+			resp.Header.Set("Ratelimit", "limit=100, remaining=0, reset="+strconv.Itoa(int(want.Seconds())))
+
+			// Jitter is random, so sample repeatedly rather than trusting one draw.
+			for range 20 {
+				got := c.rateLimitBackoff(minWait, maxWait, resp)
+				assert.GreaterOrEqual(t, got, want, "must wait at least the window the server asked for")
+				assert.Less(t, got, 2*want, "jitter must not inflate a short window")
+			}
+		})
+	}
+}
+
 func TestClient_RateLimitBackoff_HonoursShortReset(t *testing.T) {
 	c := &Client{}
 	resp := &http.Response{StatusCode: http.StatusTooManyRequests, Header: http.Header{}}

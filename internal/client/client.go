@@ -49,6 +49,10 @@ const (
 	// maxRedirects bounds redirect chains within the configured origin.
 	maxRedirects = 5
 
+	// backoffJitterDivisor sets how much jitter is added to a rate-limit
+	// backoff, as a fraction of the wait itself (wait/4, so up to +25%).
+	backoffJitterDivisor = 4
+
 	// maxErrorDetailLength bounds how much server-supplied text is carried in
 	// an APIError. The detail reaches Vault lease warnings and the audit log,
 	// so it is kept short rather than echoing an arbitrary response body.
@@ -202,11 +206,6 @@ func (c *Client) retryBackoff(minWait, maxWait time.Duration, attemptNum int, re
 // expires first — and an unbounded value lets a hostile or malfunctioning
 // server stall the request for as long as it likes.
 func (c *Client) rateLimitBackoff(minWait, maxWait time.Duration, resp *http.Response) time.Duration {
-	var jitter time.Duration
-	if maxWait > minWait {
-		jitter = time.Duration(rand.Int64N(int64(maxWait - minWait)))
-	}
-
 	var reset time.Duration
 	if rl := resp.Header.Get("Ratelimit"); rl != "" {
 		for _, part := range strings.Split(rl, ",") {
@@ -231,10 +230,20 @@ func (c *Client) rateLimitBackoff(minWait, maxWait time.Duration, resp *http.Res
 		}
 	}
 
-	if reset > minWait {
-		minWait = reset
+	wait := minWait
+	if reset > wait {
+		wait = reset
 	}
-	return min(minWait+jitter, maxWait)
+
+	// Jitter spreads out clients that would otherwise all retry the instant
+	// the window closes. It is a fraction of the wait rather than a draw
+	// across the whole retry range, so a short window stays short — drawing
+	// against maxWait turned a one second reset into a ~16 second wait.
+	if spread := int64(wait) / backoffJitterDivisor; spread > 0 {
+		wait += time.Duration(rand.Int64N(spread))
+	}
+
+	return min(wait, maxWait)
 }
 
 // secondsToDuration converts a server-supplied second count to a Duration,
