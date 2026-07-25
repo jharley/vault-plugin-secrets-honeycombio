@@ -62,7 +62,16 @@ jobs:
           fetch-depth: 0
       - uses: chainguard-dev/malcontent-action@053384afe0bb069ba7e2996bd8c0863731406002 # v0.4
         with:
-          fail-on-increase: true
+          # Report capability changes as a PR comment rather than gating on
+          # them. The score is the sum of every newly matched behaviour, so a
+          # change cannot avoid an increase by being well designed — importing
+          # net/url to validate a URL scores the same as importing it to fetch
+          # an attacker-supplied one. The action exposes no way to accept an
+          # individual finding, so a human reading the comment is the control.
+          fail-on-increase: false
+          # Pinned by digest: the mutable :latest tag means a rules update can
+          # change the result of an unrelated PR with no change on our side.
+          malcontent-image: cgr.dev/chainguard/malcontent@sha256:a4cd65dc4d7650b4a9c5ad59fbc91e95249cabe799a29fba9a132512e0fbd962
 
   test:
     name: Test
