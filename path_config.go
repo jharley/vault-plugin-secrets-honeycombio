@@ -170,9 +170,7 @@ func (b *honeycombBackend) pathConfigWrite(ctx context.Context, req *logical.Req
 		return logical.ErrorResponse(err.Error()), nil
 	}
 
-	// Validate credentials — New() calls /2/auth to verify the keypair
-	// and resolve the team slug.
-	c, err := client.New(ctx, &client.Config{
+	c, err := client.New(&client.Config{
 		BaseURL:   apiURL,
 		KeyID:     apiKeyID,
 		KeySecret: apiKeySecret,
@@ -181,8 +179,16 @@ func (b *honeycombBackend) pathConfigWrite(ctx context.Context, req *logical.Req
 		return logical.ErrorResponse("failed to validate credentials: %s", err), nil
 	}
 
+	// Validate the keypair and resolve the team slug. The client no longer
+	// does this on construction, so it is done explicitly here — this is the
+	// path where an operator is waiting for the answer.
+	auth, err := c.Auth(ctx)
+	if err != nil {
+		return logical.ErrorResponse("failed to validate credentials: %s", err), nil
+	}
+
 	// Verify the key has api-keys:write scope
-	if !slices.Contains(c.AuthInfo().Scopes, "api-keys:write") {
+	if !slices.Contains(auth.Scopes, "api-keys:write") {
 		return logical.ErrorResponse("management key must have 'api-keys:write' scope"), nil
 	}
 
@@ -190,7 +196,7 @@ func (b *honeycombBackend) pathConfigWrite(ctx context.Context, req *logical.Req
 		APIKeyID:     apiKeyID,
 		APIKeySecret: apiKeySecret,
 		APIURL:       apiURL,
-		TeamSlug:     c.TeamSlug(),
+		TeamSlug:     auth.TeamSlug,
 	}
 
 	entry, err := logical.StorageEntryJSON(configStoragePath, cfg)
@@ -202,7 +208,7 @@ func (b *honeycombBackend) pathConfigWrite(ctx context.Context, req *logical.Req
 	}
 
 	b.reset()
-	b.Logger().Info("config updated", "team", c.TeamSlug())
+	b.Logger().Info("config updated", "team", auth.TeamSlug)
 	return nil, nil
 }
 

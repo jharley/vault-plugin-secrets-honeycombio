@@ -17,6 +17,10 @@ const maxKeyNameLength = 100
 type walEntry struct {
 	RoleName string `json:"role_name"`
 	KeyID    string `json:"key_id"`
+	// TeamSlug is the team the key was created in, so rollback can tell
+	// whether the mount has since been pointed at a team where the key is
+	// unreachable.
+	TeamSlug string `json:"team_slug"`
 }
 
 func pathCredentials(b *honeycombBackend) *framework.Path {
@@ -103,6 +107,7 @@ func (b *honeycombBackend) pathCredentialsRead(ctx context.Context, req *logical
 	walID, err := framework.PutWAL(ctx, req.Storage, walRollbackKind, &walEntry{
 		RoleName: roleName,
 		KeyID:    apiKey.ID,
+		TeamSlug: apiKey.TeamSlug,
 	})
 	if err != nil {
 		// WAL write failed; clean up the key we just created
@@ -125,6 +130,9 @@ func (b *honeycombBackend) pathCredentialsRead(ctx context.Context, req *logical
 	internalData := map[string]any{
 		"key_id":    apiKey.ID,
 		"role_name": roleName,
+		// Record the issuing team so revocation can tell whether the mount has
+		// since been re-pointed at a team where this key is unreachable.
+		"team_slug": apiKey.TeamSlug,
 	}
 
 	resp := b.Secret(secretKeyType).Response(data, internalData)

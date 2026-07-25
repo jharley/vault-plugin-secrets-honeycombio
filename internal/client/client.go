@@ -13,6 +13,7 @@ import (
 	"reflect"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 	"unicode"
 
@@ -85,14 +86,18 @@ type Client struct {
 	base      *url.URL
 	keyID     string
 	keySecret string
-	teamSlug  string
-	authInfo  *AuthResponse
 	http      *retryablehttp.Client
+
+	// slug caches the team slug used to build v2 API paths, resolved from
+	// /2/auth on first use so that constructing a client performs no I/O.
+	slugMu sync.Mutex
+	slug   string
 }
 
-// New creates a new Honeycomb API client. It validates the credentials by
-// calling /2/auth and resolves the team slug for subsequent API calls.
-func New(ctx context.Context, cfg *Config) (*Client, error) {
+// New creates a new Honeycomb API client. It performs no network I/O; the team
+// slug is resolved on first use. Callers that need the credentials validated
+// should call Auth explicitly.
+func New(cfg *Config) (*Client, error) {
 	if cfg.BaseURL == "" {
 		return nil, fmt.Errorf("BaseURL is required")
 	}
@@ -134,24 +139,28 @@ func New(ctx context.Context, cfg *Config) (*Client, error) {
 		RetryMax:     defaultRetryMax,
 	}
 
-	auth, err := c.Auth(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("validating credentials: %w", err)
-	}
-	c.teamSlug = auth.TeamSlug
-	c.authInfo = auth
-
 	return c, nil
 }
 
-// TeamSlug returns the team slug this client is configured for.
-func (c *Client) TeamSlug() string {
-	return c.teamSlug
-}
+// TeamSlug returns the team this client's management key belongs to, fetching
+// it from /2/auth on first use and caching it for the client's lifetime. A
+// management key is scoped to exactly one team, so this is a property of the
+// credential rather than of any individual request. Failures are not cached,
+// so a transient outage does not poison later calls.
+func (c *Client) TeamSlug(ctx context.Context) (string, error) {
+	c.slugMu.Lock()
+	defer c.slugMu.Unlock()
 
-// AuthInfo returns the auth metadata retrieved during client initialization.
-func (c *Client) AuthInfo() *AuthResponse {
-	return c.authInfo
+	if c.slug != "" {
+		return c.slug, nil
+	}
+
+	auth, err := c.Auth(ctx)
+	if err != nil {
+		return "", fmt.Errorf("resolving team: %w", err)
+	}
+	c.slug = auth.TeamSlug
+	return c.slug, nil
 }
 
 // SetRetryWait configures the retry wait bounds. Intended for testing.
@@ -368,6 +377,11 @@ type APIKeyResponse struct {
 	Name    string
 	KeyType string
 	Secret  string
+
+	// TeamSlug is the team the key was created in. Callers should record it
+	// so they can tell later whether the key is still reachable with the
+	// credential they hold.
+	TeamSlug string
 }
 
 // JSON:API model structs for hashicorp/jsonapi serialization.
@@ -435,7 +449,7 @@ func (c *Client) Auth(ctx context.Context) (*AuthResponse, error) {
 		return nil, fmt.Errorf("decoding auth response: %w", err)
 	}
 
-	if result.Team == nil {
+	if result.Team == nil || result.Team.Slug == "" {
 		return nil, fmt.Errorf("team not found in auth response")
 	}
 
@@ -453,8 +467,13 @@ func (c *Client) Auth(ctx context.Context) (*AuthResponse, error) {
 // ListEnvironments returns all environments for the given team.
 // Follows cursor-based pagination to retrieve all pages.
 func (c *Client) ListEnvironments(ctx context.Context) ([]Environment, error) {
+	slug, err := c.TeamSlug(ctx)
+	if err != nil {
+		return nil, err
+	}
+
 	var allEnvs []Environment
-	endpoint := c.baseURL + "/2/teams/" + url.PathEscape(c.teamSlug) + "/environments"
+	endpoint := c.baseURL + "/2/teams/" + url.PathEscape(slug) + "/environments"
 
 	for page := 0; ; page++ {
 		if page >= maxPaginationPages {
@@ -573,6 +592,11 @@ func readLimited(r io.Reader) ([]byte, error) {
 
 // CreateAPIKey creates a new API key in the given team.
 func (c *Client) CreateAPIKey(ctx context.Context, input *CreateAPIKeyRequest) (*APIKeyResponse, error) {
+	slug, err := c.TeamSlug(ctx)
+	if err != nil {
+		return nil, err
+	}
+
 	key := &apiKey{
 		Name:        input.Name,
 		KeyType:     input.KeyType,
@@ -585,7 +609,7 @@ func (c *Client) CreateAPIKey(ctx context.Context, input *CreateAPIKeyRequest) (
 		return nil, fmt.Errorf("marshaling create API key request: %w", err)
 	}
 
-	req, err := retryablehttp.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/2/teams/"+url.PathEscape(c.teamSlug)+"/api-keys", &buf)
+	req, err := retryablehttp.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/2/teams/"+url.PathEscape(slug)+"/api-keys", &buf)
 	if err != nil {
 		return nil, fmt.Errorf("creating API key request: %w", err)
 	}
@@ -614,16 +638,22 @@ func (c *Client) CreateAPIKey(ctx context.Context, input *CreateAPIKeyRequest) (
 	}
 
 	return &APIKeyResponse{
-		ID:      result.ID,
-		Name:    result.Name,
-		KeyType: result.KeyType,
-		Secret:  result.Secret,
+		ID:       result.ID,
+		Name:     result.Name,
+		KeyType:  result.KeyType,
+		Secret:   result.Secret,
+		TeamSlug: slug,
 	}, nil
 }
 
 // DeleteAPIKey deletes an API key. Treats 404 as success (idempotent).
 func (c *Client) DeleteAPIKey(ctx context.Context, keyID string) error {
-	req, err := retryablehttp.NewRequestWithContext(ctx, http.MethodDelete, c.baseURL+"/2/teams/"+url.PathEscape(c.teamSlug)+"/api-keys/"+url.PathEscape(keyID), nil)
+	slug, err := c.TeamSlug(ctx)
+	if err != nil {
+		return err
+	}
+
+	req, err := retryablehttp.NewRequestWithContext(ctx, http.MethodDelete, c.baseURL+"/2/teams/"+url.PathEscape(slug)+"/api-keys/"+url.PathEscape(keyID), nil)
 	if err != nil {
 		return fmt.Errorf("creating delete API key request: %w", err)
 	}
