@@ -17,6 +17,31 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// writeTestAuthResponse writes a /2/auth response for team "test-team".
+func writeTestAuthResponse(w http.ResponseWriter) {
+	writeAuthResponseForTeam(w, "test-team")
+}
+
+// writeAuthResponseForTeam writes a /2/auth response naming the given team.
+func writeAuthResponseForTeam(w http.ResponseWriter, slug string) {
+	w.Header().Set("Content-Type", jsonapi.MediaType)
+	json.NewEncoder(w).Encode(map[string]any{
+		"data": map[string]any{
+			"id": "hcxmk_testkey", "type": "api-keys",
+			"attributes": map[string]any{
+				"name": "test key", "key_type": "management",
+				"disabled": false, "scopes": []string{"api-keys:write"},
+			},
+			"relationships": map[string]any{
+				"team": map[string]any{"data": map[string]any{"id": "hcxtm_team1", "type": "teams"}},
+			},
+		},
+		"included": []map[string]any{
+			{"id": "hcxtm_team1", "type": "teams", "attributes": map[string]any{"name": "Test Team", "slug": slug}},
+		},
+	})
+}
+
 // allowPlaintextAPIURL permits the plaintext endpoints served by httptest.
 // api_url requires HTTPS unless this escape hatch is set.
 func allowPlaintextAPIURL(t *testing.T) {
@@ -1108,9 +1133,8 @@ func TestSecretRevoke_TransientFailureReturnsError(t *testing.T) {
 }
 
 // TestSecretRevoke_TransientAuthFailureReturnsError verifies that a transient
-// failure while building the client is retried too. Revocation reaches this
-// path on any cold start (after a config write, plugin reload or Vault
-// restart), where /2/auth is called before the delete.
+// failure while resolving the team is retried too, rather than being reported
+// as a successful revocation.
 func TestSecretRevoke_TransientAuthFailureReturnsError(t *testing.T) {
 	ctx := context.Background()
 	allowPlaintextAPIURL(t)
@@ -1152,8 +1176,8 @@ func TestSecretRevoke_TransientAuthFailureReturnsError(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	// Simulate a cold start during a Honeycomb outage: the cached client is
-	// gone and /2/auth is failing.
+	// Simulate a cold start during a Honeycomb outage: the client has to
+	// resolve the team, and /2/auth is failing.
 	b.reset()
 	authStatus.Store(http.StatusServiceUnavailable)
 
@@ -1164,10 +1188,139 @@ func TestSecretRevoke_TransientAuthFailureReturnsError(t *testing.T) {
 	_, err = b.secretKeyRevoke(revokeCtx, &logical.Request{
 		Storage: config.StorageView,
 		Secret: &logical.Secret{
-			InternalData: map[string]any{"key_id": "hcxik_live", "role_name": "test-role"},
+			InternalData: map[string]any{
+				"key_id": "hcxik_live", "role_name": "test-role",
+				// Present so the team check runs and has to resolve the slug,
+				// which is where the transient failure surfaces.
+				"team_slug": "test-team",
+			},
 		},
 	}, &framework.FieldData{})
-	assert.Error(t, err, "a transient auth failure must be retried, not reported as revoked")
+	assert.ErrorContains(t, err, "resolving team",
+		"a transient auth failure must be retried, not reported as revoked")
+}
+
+// TestSecretRevoke_WarnsWhenTeamChanged verifies that a key issued under a
+// different team is not silently reported as revoked. A management key is
+// scoped to one team, so the current credential cannot delete it — and a
+// delete attempt would 404, which DeleteAPIKey treats as success.
+func TestSecretRevoke_WarnsWhenTeamChanged(t *testing.T) {
+	ctx := context.Background()
+	b, storage, srv := newTestBackend(t, ctx)
+
+	_, err := b.HandleRequest(ctx, &logical.Request{
+		Operation: logical.UpdateOperation, Path: "config", Storage: storage,
+		Data: map[string]any{
+			"api_key_id": "hcxmk_testkey", "api_key_secret": "supersecret", "api_url": srv.URL,
+		},
+	})
+	require.NoError(t, err)
+
+	_, err = b.HandleRequest(ctx, &logical.Request{
+		Operation: logical.CreateOperation, Path: "roles/tester", Storage: storage,
+		Data: map[string]any{
+			"key_type": "ingest", "environment": "production", "create_datasets": true,
+		},
+	})
+	require.NoError(t, err)
+
+	issued, err := b.HandleRequest(ctx, &logical.Request{
+		Operation: logical.ReadOperation, Path: "creds/tester", Storage: storage,
+	})
+	require.NoError(t, err)
+	require.NotNil(t, issued)
+	require.NotNil(t, issued.Secret)
+
+	// The operator re-points the mount at a different team while the lease is
+	// still outstanding.
+	var deleteCalls atomic.Int32
+	other := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/2/auth" {
+			// The new management key belongs to a different team; /2/auth is
+			// what tells the client which team it acts on.
+			writeAuthResponseForTeam(w, "a-different-team")
+			return
+		}
+		if r.Method == http.MethodDelete {
+			deleteCalls.Add(1)
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	t.Cleanup(other.Close)
+
+	repointConfigURL(t, ctx, storage, other.URL)
+	b.reset()
+
+	resp, err := b.secretKeyRevoke(ctx, &logical.Request{
+		Storage: storage,
+		Secret:  issued.Secret,
+	}, &framework.FieldData{})
+	require.NoError(t, err, "a mismatch is permanent, so the lease should not be retried forever")
+	require.NotNil(t, resp)
+	require.Len(t, resp.Warnings, 1)
+
+	assert.Contains(t, resp.Warnings[0], "test-team", "warning should name the issuing team")
+	assert.Contains(t, resp.Warnings[0], "a-different-team", "warning should name the configured team")
+	assert.Contains(t, resp.Warnings[0], "manually", "warning should say the key needs manual cleanup")
+	assert.Zero(t, deleteCalls.Load(),
+		"must not attempt a delete the current management key cannot perform")
+}
+
+// TestSecretRevoke_ResolvesTeamOnce verifies the team is resolved from /2/auth
+// once per client and then reused, rather than on every revocation.
+func TestSecretRevoke_ResolvesTeamOnce(t *testing.T) {
+	ctx := context.Background()
+	b, storage, srv := newTestBackend(t, ctx)
+
+	_, err := b.HandleRequest(ctx, &logical.Request{
+		Operation: logical.UpdateOperation, Path: "config", Storage: storage,
+		Data: map[string]any{
+			"api_key_id": "hcxmk_testkey", "api_key_secret": "supersecret", "api_url": srv.URL,
+		},
+	})
+	require.NoError(t, err)
+
+	// Drop the cached client, as a plugin reload or Vault restart would.
+	b.reset()
+
+	var authCalls atomic.Int32
+	counting := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/2/auth" {
+			authCalls.Add(1)
+			writeTestAuthResponse(w)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	t.Cleanup(counting.Close)
+	repointConfigURL(t, ctx, storage, counting.URL)
+
+	for range 3 {
+		resp, err := b.secretKeyRevoke(ctx, &logical.Request{
+			Storage: storage,
+			Secret: &logical.Secret{
+				InternalData: map[string]any{"key_id": "hcxik_torevoke", "role_name": "test-role"},
+			},
+		}, &framework.FieldData{})
+		require.NoError(t, err)
+		assert.Nil(t, resp, "revocation should succeed cleanly")
+	}
+
+	assert.Equal(t, int32(1), authCalls.Load(),
+		"the team should be resolved once and cached for the client's lifetime")
+}
+
+// repointConfigURL rewrites the stored api_url, keeping everything else.
+func repointConfigURL(t *testing.T, ctx context.Context, s logical.Storage, apiURL string) {
+	t.Helper()
+	cfg, err := getConfig(ctx, s)
+	require.NoError(t, err)
+	require.NotNil(t, cfg)
+
+	cfg.APIURL = apiURL
+	entry, err := logical.StorageEntryJSON(configStoragePath, cfg)
+	require.NoError(t, err)
+	require.NoError(t, s.Put(ctx, entry))
 }
 
 // TestSecretRevoke_PermanentFailureWarns verifies that an unrecoverable
@@ -1570,4 +1723,94 @@ func TestFullLifecycle(t *testing.T) {
 	}, &framework.FieldData{})
 	require.NoError(t, err)
 	assert.Nil(t, revokeResp)
+}
+
+// TestSecretRevoke_IsBounded verifies that a single revocation cannot occupy a
+// Vault expiration worker for the client's whole retry schedule. Measured
+// unbounded, one failing delete blocked for 89s.
+func TestSecretRevoke_IsBounded(t *testing.T) {
+	ctx := context.Background()
+	allowPlaintextAPIURL(t)
+
+	original := revokeTimeout
+	revokeTimeout = 250 * time.Millisecond
+	t.Cleanup(func() { revokeTimeout = original })
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/2/auth" {
+			writeTestAuthResponse(w)
+			return
+		}
+		// Far longer than the bound: without one, revoke waits this out.
+		// Returns as soon as the client gives up so the test does not.
+		select {
+		case <-r.Context().Done():
+		case <-time.After(5 * time.Second):
+		}
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	t.Cleanup(srv.Close)
+
+	config := logical.TestBackendConfig()
+	config.StorageView = &logical.InmemStorage{}
+	b := backend()
+	require.NoError(t, b.Setup(ctx, config))
+	_, err := b.HandleRequest(ctx, &logical.Request{
+		Operation: logical.UpdateOperation, Path: "config", Storage: config.StorageView,
+		Data: map[string]any{"api_key_id": "k", "api_key_secret": "s", "api_url": srv.URL},
+	})
+	require.NoError(t, err)
+
+	start := time.Now()
+	_, err = b.secretKeyRevoke(ctx, &logical.Request{
+		Storage: config.StorageView,
+		Secret: &logical.Secret{
+			InternalData: map[string]any{
+				"key_id": "hcxik_live", "role_name": "r", "team_slug": "test-team",
+			},
+		},
+	}, &framework.FieldData{})
+	elapsed := time.Since(start)
+
+	assert.Error(t, err, "a bounded-out revocation must be retryable, not reported as revoked")
+	assert.Less(t, elapsed, 3*time.Second,
+		"revocation must give up on its own rather than occupying the worker, took %v", elapsed)
+}
+
+// TestWALRollback_WrongTeamDoesNotDelete verifies that rollback does not issue
+// a delete against a team that cannot own the key. Such a delete 404s, and
+// DeleteAPIKey treats 404 as success — discarding the WAL entry while the key
+// stays live.
+func TestWALRollback_WrongTeamDoesNotDelete(t *testing.T) {
+	ctx := context.Background()
+	b, storage, srv := newTestBackend(t, ctx)
+
+	_, err := b.HandleRequest(ctx, &logical.Request{
+		Operation: logical.UpdateOperation, Path: "config", Storage: storage,
+		Data: map[string]any{"api_key_id": "k", "api_key_secret": "s", "api_url": srv.URL},
+	})
+	require.NoError(t, err)
+
+	var deleteCalls atomic.Int32
+	other := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/2/auth" {
+			writeAuthResponseForTeam(w, "a-different-team")
+			return
+		}
+		if r.Method == http.MethodDelete {
+			deleteCalls.Add(1)
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	t.Cleanup(other.Close)
+
+	repointConfigURL(t, ctx, storage, other.URL)
+	b.reset()
+
+	err = b.walRollback(ctx, &logical.Request{Storage: storage}, walRollbackKind,
+		map[string]any{"role_name": "r", "key_id": "hcxik_live", "team_slug": "test-team"})
+
+	require.NoError(t, err, "the entry is unrecoverable, so it should be dropped rather than retried forever")
+	assert.Zero(t, deleteCalls.Load(),
+		"must not issue a delete against a team that cannot own the key")
 }

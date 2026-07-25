@@ -12,12 +12,17 @@ import (
 	"github.com/jharley/vault-plugin-secrets-honeycombio/internal/client"
 )
 
-const (
-	secretKeyType = "honeycomb_key"
+const secretKeyType = "honeycomb_key"
 
-	// revokeClientTimeout bounds the client setup performed during revocation.
-	revokeClientTimeout = 10 * time.Second
-)
+// revokeTimeout bounds a single revocation attempt. Vault's expiration manager
+// runs revocations in a bounded worker pool and retries with its own backoff,
+// so holding a worker for the client's entire retry schedule starves lease
+// expiration across the whole instance during a Honeycomb outage — measured at
+// 89s for one failing delete, and worse with an unlucky jitter draw. Failing
+// sooner and letting Vault retry is strictly better than occupying the worker.
+//
+// A var so tests can shorten it; nothing outside tests reassigns it.
+var revokeTimeout = 60 * time.Second
 
 func secretHoneycombKey(b *honeycombBackend) *framework.Secret {
 	return &framework.Secret{
@@ -54,18 +59,15 @@ func (b *honeycombBackend) secretKeyRevoke(ctx context.Context, req *logical.Req
 		return nil, fmt.Errorf("key_id not found in secret internal data")
 	}
 
-	// Building the client calls /2/auth, which retries on failure. Bound it so
-	// a Honeycomb outage cannot occupy an expiration worker for the whole
-	// retry schedule; Vault retries the revocation itself, with better
-	// backoff than blocking here would give.
-	clientCtx, cancel := context.WithTimeout(ctx, revokeClientTimeout)
+	ctx, cancel := context.WithTimeout(ctx, revokeTimeout)
 	defer cancel()
 
-	c, err := b.getClient(clientCtx, req.Storage)
+	c, err := b.getClient(ctx, req.Storage)
 	if err != nil {
-		// A Honeycomb outage fails here on any cold path (after a config
-		// write, plugin reload or restart). That is transient and must be
-		// retried, or the lease is dropped while the key is still live.
+		// Building a client is I/O-free when the team slug is stored, so this
+		// normally fails only on configuration problems. It can still make a
+		// network call when the slug is absent, and that is transient — it
+		// must be retried, or the lease is dropped while the key is live.
 		if isRetryableRevokeError(err) {
 			b.Logger().Error("cannot revoke API key: client unavailable, will retry", "key_id", keyID, "error", err)
 			return nil, fmt.Errorf("building client to revoke Honeycomb API key %s: %w", keyID, err)
@@ -77,6 +79,41 @@ func (b *honeycombBackend) secretKeyRevoke(ctx context.Context, req *logical.Req
 		return &logical.Response{
 			Warnings: []string{fmt.Sprintf("failed to revoke Honeycomb API key %s: %s", keyID, err)},
 		}, nil
+	}
+
+	// A management key belongs to exactly one team, so a key issued under a
+	// different team cannot be deleted with the credential configured now. The
+	// request would fail, and a 404 is indistinguishable from the key already
+	// being gone — so it would be reported as a successful revocation. Detect
+	// the mismatch and say plainly that the key needs manual cleanup.
+	//
+	// The current team is resolved from /2/auth, so this compares the lease
+	// against ground truth and fires only when the mount has genuinely been
+	// reconfigured onto another team's management key.
+	//
+	// Leases issued before the team was recorded carry no slug; those skip the
+	// check and behave as they did before.
+	if issuedTeam, _ := req.Secret.InternalData["team_slug"].(string); issuedTeam != "" {
+		currentTeam, err := c.TeamSlug(ctx)
+		if err != nil {
+			if isRetryableRevokeError(err) {
+				return nil, fmt.Errorf("resolving team to revoke Honeycomb API key %s: %w", keyID, err)
+			}
+			return &logical.Response{
+				Warnings: []string{fmt.Sprintf("failed to revoke Honeycomb API key %s: %s", keyID, err)},
+			}, nil
+		}
+
+		if issuedTeam != currentTeam {
+			b.Logger().Error("cannot revoke API key: issued under a different team",
+				"key_id", keyID, "issued_team", issuedTeam, "configured_team", currentTeam)
+			return &logical.Response{
+				Warnings: []string{fmt.Sprintf(
+					"Honeycomb API key %s was issued in team %q but this mount is now configured for team %q; "+
+						"the current management key cannot revoke it and the key must be deleted manually",
+					keyID, issuedTeam, currentTeam)},
+			}, nil
+		}
 	}
 
 	b.Logger().Info("revoking API key", "key_id", keyID)

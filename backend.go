@@ -101,7 +101,7 @@ func (b *honeycombBackend) getClient(ctx context.Context, s logical.Storage) (*c
 		return nil, &invalidConfigError{fmt.Errorf("stored configuration is no longer valid: %w", err)}
 	}
 
-	c, err := client.New(ctx, &client.Config{
+	c, err := client.New(&client.Config{
 		BaseURL:   cfg.APIURL,
 		KeyID:     cfg.APIKeyID,
 		KeySecret: cfg.APIKeySecret,
@@ -193,6 +193,25 @@ func (b *honeycombBackend) walRollback(ctx context.Context, req *logical.Request
 	c, err := b.getClient(ctx, req.Storage)
 	if err != nil {
 		return fmt.Errorf("getting client for WAL rollback: %w", err)
+	}
+
+	// A management key is scoped to one team, so if the mount has been pointed
+	// at a different team since this entry was written, the delete would go to
+	// a team that does not own the key, 404, and be swallowed as success —
+	// discarding the WAL entry and leaving the key live. Give up loudly
+	// instead. Returning nil drops the entry deliberately: no amount of
+	// retrying reaches a key this credential has no authority over.
+	if entry.TeamSlug != "" {
+		currentTeam, err := c.TeamSlug(ctx)
+		if err != nil {
+			return fmt.Errorf("resolving team for WAL rollback: %w", err)
+		}
+		if entry.TeamSlug != currentTeam {
+			b.Logger().Error("cannot roll back orphaned API key: issued under a different team",
+				"key_id", entry.KeyID, "role", entry.RoleName,
+				"issued_team", entry.TeamSlug, "configured_team", currentTeam)
+			return nil
+		}
 	}
 
 	b.Logger().Warn("rolling back orphaned API key", "key_id", entry.KeyID, "role", entry.RoleName)

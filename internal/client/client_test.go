@@ -78,9 +78,8 @@ func newTestServer(t *testing.T, handler http.HandlerFunc) *httptest.Server {
 // for fast tests.
 func newTestClient(t *testing.T, handler http.HandlerFunc) (*Client, *httptest.Server) {
 	t.Helper()
-	ctx := context.Background()
 	srv := newTestServer(t, handler)
-	c, err := New(ctx, &Config{BaseURL: srv.URL, KeyID: "id", KeySecret: "secret"})
+	c, err := New(&Config{BaseURL: srv.URL, KeyID: "id", KeySecret: "secret"})
 	require.NoError(t, err)
 	// Speed up retries for tests
 	c.http.RetryWaitMin = 0
@@ -92,30 +91,36 @@ func TestNewClient(t *testing.T) {
 	ctx := context.Background()
 	srv := newTestServer(t, nil)
 
-	c, err := New(ctx, &Config{BaseURL: srv.URL, KeyID: "id", KeySecret: "secret"})
+	c, err := New(&Config{BaseURL: srv.URL, KeyID: "id", KeySecret: "secret"})
 	require.NoError(t, err)
 	require.NotNil(t, c)
-	assert.Equal(t, "my-team", c.TeamSlug())
-	assert.Equal(t, "management", c.AuthInfo().KeyType)
+
+	auth, err := c.Auth(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, "my-team", auth.TeamSlug)
+	assert.Equal(t, "management", auth.KeyType)
 }
 
 func TestNewClient_InvalidURL(t *testing.T) {
-	ctx := context.Background()
-
-	_, err := New(ctx, &Config{BaseURL: "", KeyID: "id", KeySecret: "secret"})
+	_, err := New(&Config{BaseURL: "", KeyID: "id", KeySecret: "secret"})
 	require.Error(t, err)
 }
 
-func TestNewClient_BadCredentials(t *testing.T) {
+func TestClient_Auth_BadCredentials(t *testing.T) {
 	ctx := context.Background()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusUnauthorized)
 	}))
 	t.Cleanup(srv.Close)
 
-	_, err := New(ctx, &Config{BaseURL: srv.URL, KeyID: "bad", KeySecret: "creds"})
+	// Construction succeeds — it performs no I/O. The credentials are only
+	// exercised when Auth is called.
+	c, err := New(&Config{BaseURL: srv.URL, KeyID: "bad", KeySecret: "creds"})
+	require.NoError(t, err)
+
+	_, err = c.Auth(ctx)
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "validating credentials")
+	assert.Contains(t, err.Error(), "401")
 }
 
 func TestClient_AuthHeader(t *testing.T) {
@@ -133,7 +138,11 @@ func TestClient_AuthHeader(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 
-	_, err := New(ctx, &Config{BaseURL: srv.URL, KeyID: "hcxmk_testKeyID", KeySecret: "testSecret"})
+	c, err := New(&Config{BaseURL: srv.URL, KeyID: "hcxmk_testKeyID", KeySecret: "testSecret"})
+	require.NoError(t, err)
+
+	// Construction makes no request, so issue one to observe the headers.
+	_, err = c.Auth(ctx)
 	require.NoError(t, err)
 
 	assert.Equal(t, "Bearer hcxmk_testKeyID:testSecret", gotAuth)
@@ -235,7 +244,7 @@ func TestClient_NetworkErrorExhaustion(t *testing.T) {
 	ctx := context.Background()
 	srv := newTestServer(t, nil)
 
-	c, err := New(ctx, &Config{BaseURL: srv.URL, KeyID: "id", KeySecret: "secret"})
+	c, err := New(&Config{BaseURL: srv.URL, KeyID: "id", KeySecret: "secret"})
 	require.NoError(t, err)
 	c.http.RetryWaitMin = 0
 	c.http.RetryWaitMax = 0
@@ -295,16 +304,19 @@ func TestClient_Auth(t *testing.T) {
 	ctx := context.Background()
 	srv := newTestServer(t, nil)
 
-	c, err := New(ctx, &Config{BaseURL: srv.URL, KeyID: "id", KeySecret: "secret"})
+	c, err := New(&Config{BaseURL: srv.URL, KeyID: "id", KeySecret: "secret"})
 	require.NoError(t, err)
 
-	assert.Equal(t, "key123", c.AuthInfo().KeyID)
-	assert.Equal(t, "test-key", c.AuthInfo().Name)
-	assert.Equal(t, "management", c.AuthInfo().KeyType)
-	assert.False(t, c.AuthInfo().Disabled)
-	assert.Equal(t, []string{"api-keys:write"}, c.AuthInfo().Scopes)
-	assert.Equal(t, "my-team", c.TeamSlug())
-	assert.Equal(t, "team456", c.AuthInfo().TeamID)
+	auth, err := c.Auth(ctx)
+	require.NoError(t, err)
+
+	assert.Equal(t, "key123", auth.KeyID)
+	assert.Equal(t, "test-key", auth.Name)
+	assert.Equal(t, "management", auth.KeyType)
+	assert.False(t, auth.Disabled)
+	assert.Equal(t, []string{"api-keys:write"}, auth.Scopes)
+	assert.Equal(t, "my-team", auth.TeamSlug)
+	assert.Equal(t, "team456", auth.TeamID)
 }
 
 func TestClient_ListEnvironments(t *testing.T) {
@@ -463,7 +475,7 @@ func TestClient_ListEnvironments_PreservesBasePathPrefix(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 
-	c, err := New(ctx, &Config{BaseURL: srv.URL + "/honeycomb", KeyID: "id", KeySecret: "secret"})
+	c, err := New(&Config{BaseURL: srv.URL + "/honeycomb", KeyID: "id", KeySecret: "secret"})
 	require.NoError(t, err)
 
 	envs, err := c.ListEnvironments(ctx)
@@ -688,4 +700,75 @@ func TestClient_DeleteAPIKey_NotFound(t *testing.T) {
 
 	err := c.DeleteAPIKey(ctx, "nonexistent")
 	require.NoError(t, err, "404 should be treated as success")
+}
+
+// TestNewClient_MakesNoRequest verifies that constructing a client performs no
+// network I/O. An eager /2/auth round-trip in the constructor is unbounded
+// blocking work on every cold path, and costs an extra request per revocation.
+func TestNewClient_MakesNoRequest(t *testing.T) {
+	var calls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		writeAuthResponse(w)
+	}))
+	t.Cleanup(srv.Close)
+
+	c, err := New(&Config{BaseURL: srv.URL, KeyID: "id", KeySecret: "secret"})
+	require.NoError(t, err)
+	require.NotNil(t, c)
+	assert.Zero(t, calls.Load(), "construction must not call the API")
+}
+
+// TestClient_ResolvesTeamSlugOnceLazily verifies the slug is fetched on first
+// use when it was not seeded, then cached for subsequent calls.
+func TestClient_ResolvesTeamSlugOnceLazily(t *testing.T) {
+	ctx := context.Background()
+	var authCalls atomic.Int32
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/2/auth" {
+			authCalls.Add(1)
+			writeAuthResponse(w)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	t.Cleanup(srv.Close)
+
+	c, err := New(&Config{BaseURL: srv.URL, KeyID: "id", KeySecret: "secret"})
+	require.NoError(t, err)
+
+	require.NoError(t, c.DeleteAPIKey(ctx, "key1"))
+	require.NoError(t, c.DeleteAPIKey(ctx, "key2"))
+	assert.Equal(t, int32(1), authCalls.Load(), "team slug should be resolved once and cached")
+}
+
+// TestClient_DoesNotCacheAuthFailure verifies a transient /2/auth failure does
+// not poison the client for later calls.
+func TestClient_DoesNotCacheAuthFailure(t *testing.T) {
+	ctx := context.Background()
+	var failAuth atomic.Bool
+	failAuth.Store(true)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/2/auth" {
+			if failAuth.Load() {
+				w.WriteHeader(http.StatusServiceUnavailable)
+				return
+			}
+			writeAuthResponse(w)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	t.Cleanup(srv.Close)
+
+	c, err := New(&Config{BaseURL: srv.URL, KeyID: "id", KeySecret: "secret"})
+	require.NoError(t, err)
+	c.SetRetryWait(0, 0)
+
+	assert.Error(t, c.DeleteAPIKey(ctx, "key1"), "should fail while /2/auth is down")
+
+	failAuth.Store(false)
+	assert.NoError(t, c.DeleteAPIKey(ctx, "key2"), "should recover once /2/auth works")
 }
