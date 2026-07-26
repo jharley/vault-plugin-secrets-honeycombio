@@ -101,10 +101,11 @@ func (b *honeycombBackend) getClient(ctx context.Context, s logical.Storage) (*c
 	}
 
 	c, err := client.New(&client.Config{
-		BaseURL:   cfg.APIURL,
-		KeyID:     cfg.APIKeyID,
-		KeySecret: cfg.APIKeySecret,
-		Logger:    b.Logger(),
+		BaseURL:          cfg.APIURL,
+		KeyID:            cfg.APIKeyID,
+		KeySecret:        cfg.APIKeySecret,
+		AllowInsecureURL: allowInsecureURL(),
+		Logger:           b.Logger(),
 	})
 	if err != nil {
 		return nil, err
