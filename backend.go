@@ -39,6 +39,13 @@ const envCacheTTL = 5 * time.Minute
 
 type honeycombBackend struct {
 	*framework.Backend
+
+	// allowInsecureURL permits a plaintext api_url. It is read from the
+	// environment once when the backend is built: a process's environment is
+	// fixed for its lifetime, so re-reading it per request bought nothing and
+	// meant every test touching a plaintext endpoint had to manipulate it.
+	allowInsecureURL bool
+
 	lock           sync.RWMutex
 	client         *client.Client
 	envCache       map[string]string
@@ -46,7 +53,7 @@ type honeycombBackend struct {
 }
 
 func backend() *honeycombBackend {
-	b := &honeycombBackend{}
+	b := &honeycombBackend{allowInsecureURL: insecureURLAllowedByEnv()}
 	b.Backend = &framework.Backend{
 		Help:        strings.TrimSpace(backendHelp),
 		BackendType: logical.TypeLogical,
@@ -96,7 +103,7 @@ func (b *honeycombBackend) getClient(ctx context.Context, s logical.Storage) (*c
 	// Re-check the stored URL. Validating only on write would leave a config
 	// stored before HTTPS was required shipping the management key in
 	// cleartext indefinitely.
-	if err := validateAPIURL(cfg.APIURL); err != nil {
+	if err := b.validateAPIURL(cfg.APIURL); err != nil {
 		return nil, fmt.Errorf("stored configuration is no longer valid: %w", err)
 	}
 
@@ -104,7 +111,7 @@ func (b *honeycombBackend) getClient(ctx context.Context, s logical.Storage) (*c
 		BaseURL:          cfg.APIURL,
 		KeyID:            cfg.APIKeyID,
 		KeySecret:        cfg.APIKeySecret,
-		AllowInsecureURL: allowInsecureURL(),
+		AllowInsecureURL: b.allowInsecureURL,
 		Logger:           b.Logger(),
 	})
 	if err != nil {
