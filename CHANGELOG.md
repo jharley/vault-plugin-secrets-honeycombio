@@ -5,6 +5,45 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.3.0 (2026-07-26)
+
+### Bug Fixes
+
+- harden against untrusted API responses and require HTTPS for `api_url` (#58)
+- defer /2/auth until first use and revoke against the issuing team (#60)
+- surface unrevocable keys as irrevocable leases (#61)
+- reject a malformed `team_slug` instead of skipping the team check (#62)
+
+### Improvements
+
+- report malcontent findings instead of gating on them (#59)
+- move base URL validation into the client (#63)
+- make the insecure-URL policy a backend field (#64)
+
+### Dependencies
+
+- update goreleaser archives configuration (#34)
+- bump golang from `2389ebf` to `91eda97` (#35)
+- bump hashicorp/vault from 2.0 to 2.0.1 (#36)
+- bump openbao/openbao from 2.5 to 2.5.4 (#37)
+- bump golang.org/x/net from 0.53.0 to 0.55.0 (#38)
+- bump golangci/golangci-lint-action from 9.2.0 to 9.2.1 (#39)
+- bump goreleaser/goreleaser-action from 7.2.1 to 7.2.2 (#40)
+- bump golang from 1.26.3-alpine to 1.26.4-alpine (#41)
+- bump actions/checkout from 6.0.2 to 6.0.3 (#43)
+- bump Go from 1.26.3 to 1.26.4 (#44)
+- bump openbao/openbao from 2.5.4 to 2.5.5 (#45)
+- bump hashicorp/vault from 2.0.1 to 2.0.3 (#46)
+- bump goreleaser/goreleaser-action from 7.2.2 to 7.2.3 (#49)
+- bump golang.org/x/crypto from 0.51.0 to 0.52.0 (#50)
+- bump golangci/golangci-lint-action from 9.2.1 to 9.3.0 (#51)
+- bump golang from 1.26.4-alpine to 1.26.5-alpine (#52)
+- bump google.golang.org/grpc from 1.79.3 to 1.82.1 (#53)
+- bump actions/setup-go from 6.4.0 to 7.0.0 (#54)
+- bump openbao/openbao from 2.5.5 to 2.6.0 (#55)
+- bump actions/checkout from 6.0.3 to 7.0.1 (#56)
+- bump Go from 1.26.4 to 1.26.5 (#57)
+
 ## 0.2.0 (2026-05-09)
 
 ### Improvements
