@@ -23,8 +23,7 @@ The Honeycomb.io secrets engine generates dynamic API keys
 	walRollbackKind = "honeycomb_key"
 )
 
-// errNotConfigured means no configuration has been written. It is permanent
-// until an operator acts, so callers must not retry against it.
+// errNotConfigured means no configuration has been written.
 var errNotConfigured = errors.New("backend not configured")
 
 // Factory returns a configured instance of the backend.
@@ -98,7 +97,7 @@ func (b *honeycombBackend) getClient(ctx context.Context, s logical.Storage) (*c
 	// stored before HTTPS was required shipping the management key in
 	// cleartext indefinitely.
 	if err := validateAPIURL(cfg.APIURL); err != nil {
-		return nil, &invalidConfigError{fmt.Errorf("stored configuration is no longer valid: %w", err)}
+		return nil, fmt.Errorf("stored configuration is no longer valid: %w", err)
 	}
 
 	c, err := client.New(&client.Config{

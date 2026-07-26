@@ -123,6 +123,19 @@ $ vault lease renew honeycomb/creds/production-ingest/abcd1234...
 $ vault lease revoke honeycomb/creds/production-ingest/abcd1234...
 ```
 
+If a key cannot be deleted — Honeycomb is unreachable, the management key has
+lost its permissions, or the mount has been reconfigured onto a different team
+— revocation fails rather than reporting success, so Vault retains the lease
+and eventually records it as irrevocable:
+
+```sh
+$ vault read sys/leases/count type=irrevocable
+```
+
+These are keys still live in Honeycomb. Delete the key there, then clear the
+lease with `vault lease revoke -force -prefix honeycomb/creds/<role>`. The
+`vault.expire.num_irrevocable_leases` metric is worth alerting on.
+
 ## Developing
 
 **Requirements:** Go 1.26 (see `.go-version`)
