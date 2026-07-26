@@ -80,9 +80,13 @@ func (b *honeycombBackend) secretKeyRevoke(ctx context.Context, req *logical.Req
 	//
 	// The current team is resolved from /2/auth, so this compares the lease
 	// against ground truth and fires only when the mount has genuinely been
-	// reconfigured onto another team's management key. Leases issued before
-	// the team was recorded carry no slug and skip the check.
-	if issuedTeam, _ := req.Secret.InternalData["team_slug"].(string); issuedTeam != "" {
+	// reconfigured onto another team's management key.
+	issuedTeam, err := leaseTeamSlug(req.Secret)
+	if err != nil {
+		return nil, fmt.Errorf("cannot revoke Honeycomb API key %s: %w", keyID, err)
+	}
+
+	if issuedTeam != "" {
 		currentTeam, err := c.TeamSlug(ctx)
 		if err != nil {
 			b.Logger().Error("cannot revoke API key: team unresolved", "key_id", keyID, "error", err)
@@ -112,6 +116,26 @@ func (b *honeycombBackend) secretKeyRevoke(ctx context.Context, req *logical.Req
 	}
 
 	return nil, nil
+}
+
+// leaseTeamSlug returns the team a lease's key was issued in.
+//
+// Leases predating the field carry none and return "", which skips the team
+// check and revokes as they always did. A value that is present but not a
+// string is an error rather than a silent skip: treating it as absent would
+// bypass the check, and a delete sent to the wrong team 404s, which
+// DeleteAPIKey reports as success — leaving the key live with no lease.
+func leaseTeamSlug(secret *logical.Secret) (string, error) {
+	raw, recorded := secret.InternalData["team_slug"]
+	if !recorded || raw == nil {
+		return "", nil
+	}
+
+	slug, ok := raw.(string)
+	if !ok {
+		return "", fmt.Errorf("team_slug in secret internal data is %T, not a string", raw)
+	}
+	return slug, nil
 }
 
 func (b *honeycombBackend) secretKeyRenew(ctx context.Context, req *logical.Request, _ *framework.FieldData) (*logical.Response, error) {
