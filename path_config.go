@@ -2,8 +2,8 @@ package honeycombio
 
 import (
 	"context"
+	"errors"
 	"fmt"
-	"net/url"
 	"os"
 	"slices"
 	"strconv"
@@ -26,31 +26,23 @@ const (
 	allowInsecureURLEnv = "HONEYCOMB_ALLOW_INSECURE_URL"
 )
 
-// validateAPIURL checks that the configured API URL is well formed and uses
-// HTTPS. Plaintext endpoints are rejected unless allowInsecureURLEnv is set,
-// since every request carries the management key in an Authorization header.
+// validateAPIURL checks the configured API URL, naming the field and pointing
+// at the escape hatch. The rules themselves belong to the client, which
+// enforces them at every construction site.
 func validateAPIURL(raw string) error {
-	parsed, err := url.Parse(raw)
-	if err != nil {
-		return fmt.Errorf("api_url is not a valid URL: %w", err)
-	}
-	if parsed.Host == "" {
-		return fmt.Errorf("api_url must include a host (got %q)", raw)
-	}
-
-	switch parsed.Scheme {
-	case "https":
+	err := client.ValidateBaseURL(raw, allowInsecureURL())
+	switch {
+	case err == nil:
 		return nil
-	case "http":
-		if allowInsecureURL() {
-			return nil
-		}
-		return fmt.Errorf("api_url must use https (set %s=true to allow plaintext for development)", allowInsecureURLEnv)
+	case errors.Is(err, client.ErrPlaintextURL):
+		return fmt.Errorf("api_url %w (set %s=true to allow plaintext for development)", err, allowInsecureURLEnv)
 	default:
-		return fmt.Errorf("api_url must use https, got scheme %q", parsed.Scheme)
+		return fmt.Errorf("api_url %w", err)
 	}
 }
 
+// allowInsecureURL reads the escape hatch. The environment is consulted here
+// and nowhere else, so the client takes the decision as a plain flag.
 func allowInsecureURL() bool {
 	allowed, err := strconv.ParseBool(os.Getenv(allowInsecureURLEnv))
 	return err == nil && allowed
@@ -163,9 +155,10 @@ func (b *honeycombBackend) pathConfigWrite(ctx context.Context, req *logical.Req
 	}
 
 	c, err := client.New(&client.Config{
-		BaseURL:   apiURL,
-		KeyID:     apiKeyID,
-		KeySecret: apiKeySecret,
+		BaseURL:          apiURL,
+		KeyID:            apiKeyID,
+		KeySecret:        apiKeySecret,
+		AllowInsecureURL: allowInsecureURL(),
 	})
 	if err != nil {
 		return logical.ErrorResponse("failed to validate credentials: %s", err), nil

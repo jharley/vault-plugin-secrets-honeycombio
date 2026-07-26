@@ -75,6 +75,12 @@ type Config struct {
 	// KeySecret is the Management API Key Secret.
 	KeySecret string
 
+	// AllowInsecureURL permits a plaintext http BaseURL. Every request carries
+	// the management key in an Authorization header, so this exposes it on the
+	// wire; it exists for development against a local endpoint. The caller
+	// owns the policy — the client only enforces it.
+	AllowInsecureURL bool
+
 	// Logger is an optional hclog.Logger for HTTP retry diagnostics.
 	// If nil, a no-op logger is used.
 	Logger hclog.Logger
@@ -98,23 +104,20 @@ type Client struct {
 // slug is resolved on first use. Callers that need the credentials validated
 // should call Auth explicitly.
 func New(cfg *Config) (*Client, error) {
-	if cfg.BaseURL == "" {
-		return nil, fmt.Errorf("BaseURL is required")
-	}
 	if cfg.KeyID == "" {
 		return nil, fmt.Errorf("KeyID is required")
 	}
 	if cfg.KeySecret == "" {
 		return nil, fmt.Errorf("KeySecret is required")
 	}
+	if err := ValidateBaseURL(cfg.BaseURL, cfg.AllowInsecureURL); err != nil {
+		return nil, fmt.Errorf("BaseURL %w", err)
+	}
 
 	trimmed := strings.TrimRight(cfg.BaseURL, "/")
 	base, err := url.Parse(trimmed)
 	if err != nil {
 		return nil, fmt.Errorf("parsing BaseURL: %w", err)
-	}
-	if base.Host == "" {
-		return nil, fmt.Errorf("BaseURL %q has no host", cfg.BaseURL)
 	}
 
 	c := &Client{
@@ -140,6 +143,42 @@ func New(cfg *Config) (*Client, error) {
 	}
 
 	return c, nil
+}
+
+// ErrPlaintextURL marks a base URL rejected only for being plaintext, so a
+// caller can tell it apart from a malformed one and offer the right remedy.
+var ErrPlaintextURL = errors.New("must use https")
+
+// ValidateBaseURL reports whether raw is a well-formed URL that the management
+// key can safely be sent to. Plaintext is rejected unless allowInsecure is
+// set, since every request carries the key in an Authorization header.
+//
+// Errors are phrased to read after the caller's own name for the field, e.g.
+// "api_url must use https".
+func ValidateBaseURL(raw string, allowInsecure bool) error {
+	if strings.TrimSpace(raw) == "" {
+		return errors.New("is required")
+	}
+
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		return fmt.Errorf("is not a valid URL: %w", err)
+	}
+	if parsed.Host == "" {
+		return fmt.Errorf("must include a host (got %q)", raw)
+	}
+
+	switch parsed.Scheme {
+	case "https":
+		return nil
+	case "http":
+		if allowInsecure {
+			return nil
+		}
+		return ErrPlaintextURL
+	default:
+		return fmt.Errorf("must use https, got scheme %q", parsed.Scheme)
+	}
 }
 
 // TeamSlug returns the team this client's management key belongs to, fetching

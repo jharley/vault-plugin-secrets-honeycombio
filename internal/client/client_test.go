@@ -79,7 +79,7 @@ func newTestServer(t *testing.T, handler http.HandlerFunc) *httptest.Server {
 func newTestClient(t *testing.T, handler http.HandlerFunc) (*Client, *httptest.Server) {
 	t.Helper()
 	srv := newTestServer(t, handler)
-	c, err := New(&Config{BaseURL: srv.URL, KeyID: "id", KeySecret: "secret"})
+	c, err := New(&Config{BaseURL: srv.URL, AllowInsecureURL: true, KeyID: "id", KeySecret: "secret"})
 	require.NoError(t, err)
 	// Speed up retries for tests
 	c.http.RetryWaitMin = 0
@@ -91,7 +91,7 @@ func TestNewClient(t *testing.T) {
 	ctx := context.Background()
 	srv := newTestServer(t, nil)
 
-	c, err := New(&Config{BaseURL: srv.URL, KeyID: "id", KeySecret: "secret"})
+	c, err := New(&Config{BaseURL: srv.URL, AllowInsecureURL: true, KeyID: "id", KeySecret: "secret"})
 	require.NoError(t, err)
 	require.NotNil(t, c)
 
@@ -99,11 +99,6 @@ func TestNewClient(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "my-team", auth.TeamSlug)
 	assert.Equal(t, "management", auth.KeyType)
-}
-
-func TestNewClient_InvalidURL(t *testing.T) {
-	_, err := New(&Config{BaseURL: "", KeyID: "id", KeySecret: "secret"})
-	require.Error(t, err)
 }
 
 func TestClient_Auth_BadCredentials(t *testing.T) {
@@ -115,7 +110,7 @@ func TestClient_Auth_BadCredentials(t *testing.T) {
 
 	// Construction succeeds — it performs no I/O. The credentials are only
 	// exercised when Auth is called.
-	c, err := New(&Config{BaseURL: srv.URL, KeyID: "bad", KeySecret: "creds"})
+	c, err := New(&Config{BaseURL: srv.URL, AllowInsecureURL: true, KeyID: "bad", KeySecret: "creds"})
 	require.NoError(t, err)
 
 	_, err = c.Auth(ctx)
@@ -138,7 +133,7 @@ func TestClient_AuthHeader(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 
-	c, err := New(&Config{BaseURL: srv.URL, KeyID: "hcxmk_testKeyID", KeySecret: "testSecret"})
+	c, err := New(&Config{BaseURL: srv.URL, AllowInsecureURL: true, KeyID: "hcxmk_testKeyID", KeySecret: "testSecret"})
 	require.NoError(t, err)
 
 	// Construction makes no request, so issue one to observe the headers.
@@ -244,7 +239,7 @@ func TestClient_NetworkErrorExhaustion(t *testing.T) {
 	ctx := context.Background()
 	srv := newTestServer(t, nil)
 
-	c, err := New(&Config{BaseURL: srv.URL, KeyID: "id", KeySecret: "secret"})
+	c, err := New(&Config{BaseURL: srv.URL, AllowInsecureURL: true, KeyID: "id", KeySecret: "secret"})
 	require.NoError(t, err)
 	c.http.RetryWaitMin = 0
 	c.http.RetryWaitMax = 0
@@ -304,7 +299,7 @@ func TestClient_Auth(t *testing.T) {
 	ctx := context.Background()
 	srv := newTestServer(t, nil)
 
-	c, err := New(&Config{BaseURL: srv.URL, KeyID: "id", KeySecret: "secret"})
+	c, err := New(&Config{BaseURL: srv.URL, AllowInsecureURL: true, KeyID: "id", KeySecret: "secret"})
 	require.NoError(t, err)
 
 	auth, err := c.Auth(ctx)
@@ -475,7 +470,7 @@ func TestClient_ListEnvironments_PreservesBasePathPrefix(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 
-	c, err := New(&Config{BaseURL: srv.URL + "/honeycomb", KeyID: "id", KeySecret: "secret"})
+	c, err := New(&Config{BaseURL: srv.URL + "/honeycomb", AllowInsecureURL: true, KeyID: "id", KeySecret: "secret"})
 	require.NoError(t, err)
 
 	envs, err := c.ListEnvironments(ctx)
@@ -713,7 +708,7 @@ func TestNewClient_MakesNoRequest(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 
-	c, err := New(&Config{BaseURL: srv.URL, KeyID: "id", KeySecret: "secret"})
+	c, err := New(&Config{BaseURL: srv.URL, AllowInsecureURL: true, KeyID: "id", KeySecret: "secret"})
 	require.NoError(t, err)
 	require.NotNil(t, c)
 	assert.Zero(t, calls.Load(), "construction must not call the API")
@@ -735,7 +730,7 @@ func TestClient_ResolvesTeamSlugOnceLazily(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 
-	c, err := New(&Config{BaseURL: srv.URL, KeyID: "id", KeySecret: "secret"})
+	c, err := New(&Config{BaseURL: srv.URL, AllowInsecureURL: true, KeyID: "id", KeySecret: "secret"})
 	require.NoError(t, err)
 
 	require.NoError(t, c.DeleteAPIKey(ctx, "key1"))
@@ -763,7 +758,7 @@ func TestClient_DoesNotCacheAuthFailure(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 
-	c, err := New(&Config{BaseURL: srv.URL, KeyID: "id", KeySecret: "secret"})
+	c, err := New(&Config{BaseURL: srv.URL, AllowInsecureURL: true, KeyID: "id", KeySecret: "secret"})
 	require.NoError(t, err)
 	c.SetRetryWait(0, 0)
 
@@ -771,4 +766,47 @@ func TestClient_DoesNotCacheAuthFailure(t *testing.T) {
 
 	failAuth.Store(false)
 	assert.NoError(t, c.DeleteAPIKey(ctx, "key2"), "should recover once /2/auth works")
+}
+
+// TestNewClient_ValidatesBaseURL verifies the client refuses to be built with
+// a URL it should not send the management key to. Validating here covers every
+// construction site rather than only the one path that happens to check first.
+func TestNewClient_ValidatesBaseURL(t *testing.T) {
+	rejected := map[string]string{
+		"empty":          "",
+		"no host":        "https://",
+		"not a url":      "://nonsense",
+		"unknown scheme": "ftp://honeycomb.invalid",
+		"missing scheme": "honeycomb.invalid",
+		"plaintext":      "http://honeycomb.invalid",
+	}
+	for name, raw := range rejected {
+		t.Run("rejects "+name, func(t *testing.T) {
+			_, err := New(&Config{BaseURL: raw, KeyID: "id", KeySecret: "secret"})
+			assert.Error(t, err)
+		})
+	}
+
+	t.Run("accepts https", func(t *testing.T) {
+		_, err := New(&Config{BaseURL: "https://honeycomb.invalid", KeyID: "id", KeySecret: "secret"})
+		assert.NoError(t, err)
+	})
+
+	t.Run("accepts plaintext when allowed", func(t *testing.T) {
+		_, err := New(&Config{
+			BaseURL: "http://honeycomb.invalid", KeyID: "id", KeySecret: "secret",
+			AllowInsecureURL: true,
+		})
+		assert.NoError(t, err, "the policy flag is what permits plaintext, not the environment")
+	})
+}
+
+func TestValidateBaseURL_PlaintextSentinel(t *testing.T) {
+	err := ValidateBaseURL("http://honeycomb.invalid", false)
+	require.Error(t, err)
+	assert.ErrorIs(t, err, ErrPlaintextURL,
+		"callers need to distinguish plaintext from malformed to offer the right remedy")
+
+	assert.NotErrorIs(t, ValidateBaseURL("ftp://honeycomb.invalid", false), ErrPlaintextURL)
+	assert.NoError(t, ValidateBaseURL("http://honeycomb.invalid", true))
 }
