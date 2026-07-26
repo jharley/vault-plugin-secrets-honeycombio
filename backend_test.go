@@ -1780,3 +1780,73 @@ func TestWALRollback_WrongTeamDoesNotDelete(t *testing.T) {
 	assert.Zero(t, deleteCalls.Load(),
 		"must not issue a delete against a team that cannot own the key")
 }
+
+// TestSecretRevoke_RejectsMalformedTeamSlug verifies that a team_slug which is
+// present but not a string is an error rather than a silent skip. Discarding
+// the type assertion would bypass the team check entirely — and a delete sent
+// to the wrong team 404s, which DeleteAPIKey treats as success, leaving the
+// key live with the lease gone.
+func TestSecretRevoke_RejectsMalformedTeamSlug(t *testing.T) {
+	ctx := context.Background()
+	b, storage, srv := newTestBackend(t, ctx)
+
+	_, err := b.HandleRequest(ctx, &logical.Request{
+		Operation: logical.UpdateOperation, Path: "config", Storage: storage,
+		Data: map[string]any{
+			"api_key_id": "hcxmk_testkey", "api_key_secret": "supersecret", "api_url": srv.URL,
+		},
+	})
+	require.NoError(t, err)
+
+	// hcxik_torevoke deletes successfully, so a skipped check yields a clean
+	// revocation and the malformed value goes unnoticed.
+	for name, slug := range map[string]any{
+		"number":  float64(42),
+		"boolean": true,
+		"map":     map[string]any{"slug": "test-team"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, err := b.secretKeyRevoke(ctx, &logical.Request{
+				Storage: storage,
+				Secret: &logical.Secret{
+					InternalData: map[string]any{
+						"key_id":    "hcxik_torevoke",
+						"role_name": "test-role",
+						"team_slug": slug,
+					},
+				},
+			}, &framework.FieldData{})
+			require.Error(t, err, "a malformed team_slug must not silently skip the team check")
+			assert.Contains(t, err.Error(), "team_slug")
+		})
+	}
+}
+
+// TestSecretRevoke_AbsentTeamSlugSkipsCheck verifies that a lease predating the
+// field still revokes. Absent is legitimate; malformed is not.
+func TestSecretRevoke_AbsentTeamSlugSkipsCheck(t *testing.T) {
+	ctx := context.Background()
+	b, storage, srv := newTestBackend(t, ctx)
+
+	_, err := b.HandleRequest(ctx, &logical.Request{
+		Operation: logical.UpdateOperation, Path: "config", Storage: storage,
+		Data: map[string]any{
+			"api_key_id": "hcxmk_testkey", "api_key_secret": "supersecret", "api_url": srv.URL,
+		},
+	})
+	require.NoError(t, err)
+
+	for name, internal := range map[string]map[string]any{
+		"absent": {"key_id": "hcxik_torevoke", "role_name": "test-role"},
+		"empty":  {"key_id": "hcxik_torevoke", "role_name": "test-role", "team_slug": ""},
+		"nil":    {"key_id": "hcxik_torevoke", "role_name": "test-role", "team_slug": nil},
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, err := b.secretKeyRevoke(ctx, &logical.Request{
+				Storage: storage,
+				Secret:  &logical.Secret{InternalData: internal},
+			}, &framework.FieldData{})
+			assert.NoError(t, err, "a lease without a recorded team should still revoke")
+		})
+	}
+}
