@@ -42,16 +42,42 @@ func writeAuthResponseForTeam(w http.ResponseWriter, slug string) {
 	})
 }
 
-// allowPlaintextAPIURL permits the plaintext endpoints served by httptest.
-// api_url requires HTTPS unless this escape hatch is set.
-func allowPlaintextAPIURL(t *testing.T) {
+// newBackend builds a plugin backend with in-memory storage, permitting the
+// plaintext endpoints httptest serves. Tests that need a particular API server
+// build one and wire it up with writeTestConfig.
+func newBackend(t *testing.T, ctx context.Context) (*honeycombBackend, logical.Storage) {
 	t.Helper()
-	t.Setenv("HONEYCOMB_ALLOW_INSECURE_URL", "true")
+
+	cfg := logical.TestBackendConfig()
+	cfg.StorageView = &logical.InmemStorage{}
+
+	b := backend()
+	b.allowInsecureURL = true // httptest serves plaintext
+	require.NoError(t, b.Setup(ctx, cfg))
+
+	return b, cfg.StorageView
+}
+
+// writeTestConfig points a backend at apiURL with valid management credentials.
+func writeTestConfig(t *testing.T, ctx context.Context, b *honeycombBackend, storage logical.Storage, apiURL string) {
+	t.Helper()
+
+	resp, err := b.HandleRequest(ctx, &logical.Request{
+		Operation: logical.UpdateOperation,
+		Path:      "config",
+		Storage:   storage,
+		Data: map[string]any{
+			"api_key_id":     "hcxmk_testkey",
+			"api_key_secret": "supersecret",
+			"api_url":        apiURL,
+		},
+	})
+	require.NoError(t, err)
+	require.False(t, resp.IsError(), "config write should succeed")
 }
 
 func newTestBackend(t *testing.T, ctx context.Context) (*honeycombBackend, logical.Storage, *httptest.Server) {
 	t.Helper()
-	allowPlaintextAPIURL(t)
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
@@ -134,13 +160,8 @@ func newTestBackend(t *testing.T, ctx context.Context) (*honeycombBackend, logic
 
 	t.Cleanup(srv.Close)
 
-	config := logical.TestBackendConfig()
-	config.StorageView = &logical.InmemStorage{}
-	b := backend()
-	err := b.Setup(ctx, config)
-	require.NoError(t, err)
-
-	return b, config.StorageView, srv
+	b, storage := newBackend(t, ctx)
+	return b, storage, srv
 }
 
 func TestConfigWriteRead(t *testing.T) {
@@ -193,22 +214,18 @@ func TestConfigWrite_MissingFields(t *testing.T) {
 
 func TestConfigWrite_BadCredentials(t *testing.T) {
 	ctx := context.Background()
-	allowPlaintextAPIURL(t)
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusUnauthorized)
 	}))
 	t.Cleanup(srv.Close)
 
-	config := logical.TestBackendConfig()
-	config.StorageView = &logical.InmemStorage{}
-	b := backend()
-	require.NoError(t, b.Setup(ctx, config))
+	b, storage := newBackend(t, ctx)
 
 	resp, err := b.HandleRequest(ctx, &logical.Request{
 		Operation: logical.UpdateOperation,
 		Path:      "config",
-		Storage:   config.StorageView,
+		Storage:   storage,
 		Data: map[string]any{
 			"api_key_id":     "hcxmk_badkey",
 			"api_key_secret": "badsecret",
@@ -223,7 +240,6 @@ func TestConfigWrite_BadCredentials(t *testing.T) {
 
 func TestConfigWrite_MissingScopeRejected(t *testing.T) {
 	ctx := context.Background()
-	allowPlaintextAPIURL(t)
 
 	// Mock server returning a management key without api-keys:write scope
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -246,15 +262,12 @@ func TestConfigWrite_MissingScopeRejected(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 
-	config := logical.TestBackendConfig()
-	config.StorageView = &logical.InmemStorage{}
-	b := backend()
-	require.NoError(t, b.Setup(ctx, config))
+	b, storage := newBackend(t, ctx)
 
 	resp, err := b.HandleRequest(ctx, &logical.Request{
 		Operation: logical.UpdateOperation,
 		Path:      "config",
-		Storage:   config.StorageView,
+		Storage:   storage,
 		Data: map[string]any{
 			"api_key_id":     "hcxmk_readonly",
 			"api_key_secret": "secret",
@@ -267,54 +280,40 @@ func TestConfigWrite_MissingScopeRejected(t *testing.T) {
 	assert.Contains(t, resp.Data["error"], "api-keys:write")
 }
 
-func TestValidateAPIURL(t *testing.T) {
-	t.Setenv(allowInsecureURLEnv, "")
-
-	valid := []string{
-		"https://api.honeycomb.io",
-		"https://api.eu1.honeycomb.io",
-		"https://honeycomb.invalid:8443/prefix",
-	}
-	for _, u := range valid {
-		t.Run("accepts "+u, func(t *testing.T) {
-			assert.NoError(t, validateAPIURL(u))
-		})
-	}
-
-	invalid := map[string]string{
-		"plaintext":      "http://honeycomb.invalid",
-		"no host":        "https://",
-		"unknown scheme": "ftp://honeycomb.invalid",
-		"missing scheme": "honeycomb.invalid",
-		"not a url":      "://nonsense",
-	}
-	for name, u := range invalid {
-		t.Run("rejects "+name, func(t *testing.T) {
-			assert.Error(t, validateAPIURL(u))
+// TestInsecureURLAllowedByEnv covers the one place the environment is read.
+// Everything downstream takes the decision as a plain flag, so this is the
+// only test that needs to manipulate the process environment.
+func TestInsecureURLAllowedByEnv(t *testing.T) {
+	for value, want := range map[string]bool{
+		"true":  true,
+		"TRUE":  true,
+		"1":     true,
+		"false": false,
+		"0":     false,
+		"":      false,
+		"yes":   false, // not a Go bool literal, so not accepted
+	} {
+		t.Run("value "+value, func(t *testing.T) {
+			t.Setenv(allowInsecureURLEnv, value)
+			assert.Equal(t, want, insecureURLAllowedByEnv())
 		})
 	}
 }
 
-func TestValidateAPIURL_EscapeHatchAllowsPlaintext(t *testing.T) {
+// TestBackendReadsInsecureURLFromEnv verifies the flag is picked up when the
+// backend is built, which is what lets every other test set it directly.
+func TestBackendReadsInsecureURLFromEnv(t *testing.T) {
+	t.Setenv(allowInsecureURLEnv, "true")
+	assert.True(t, backend().allowInsecureURL)
+
 	t.Setenv(allowInsecureURLEnv, "")
-	assert.Error(t, validateAPIURL("http://honeycomb.invalid"),
-		"plaintext must be rejected without the escape hatch")
-
-	allowPlaintextAPIURL(t)
-	assert.NoError(t, validateAPIURL("http://honeycomb.invalid"),
-		"escape hatch must permit plaintext")
-
-	assert.Error(t, validateAPIURL("ftp://honeycomb.invalid"),
-		"escape hatch must not permit non-HTTP schemes")
+	assert.False(t, backend().allowInsecureURL)
 }
 
-// TestConfigWrite_RejectsPlaintextURL verifies that api_url must use HTTPS.
-// A plaintext endpoint sends the Honeycomb management key over the wire in
-// cleartext on every request.
 func TestConfigWrite_RejectsPlaintextURL(t *testing.T) {
 	ctx := context.Background()
 	b, storage, srv := newTestBackend(t, ctx)
-	t.Setenv("HONEYCOMB_ALLOW_INSECURE_URL", "")
+	b.allowInsecureURL = false
 
 	resp, err := b.HandleRequest(ctx, &logical.Request{
 		Operation: logical.CreateOperation,
@@ -333,29 +332,24 @@ func TestConfigWrite_RejectsPlaintextURL(t *testing.T) {
 }
 
 // TestConfigWrite_AllowsPlaintextURLWithEscapeHatch verifies the documented
-// development escape hatch re-enables plaintext endpoints.
+// development escape hatch reaches the config handler. Parsing of the
+// environment value itself is covered by TestInsecureURLAllowedByEnv.
 func TestConfigWrite_AllowsPlaintextURLWithEscapeHatch(t *testing.T) {
 	ctx := context.Background()
+	b, storage, srv := newTestBackend(t, ctx)
 
-	for _, value := range []string{"true", "1", "TRUE"} {
-		t.Run(value, func(t *testing.T) {
-			b, storage, srv := newTestBackend(t, ctx)
-			t.Setenv("HONEYCOMB_ALLOW_INSECURE_URL", value)
-
-			resp, err := b.HandleRequest(ctx, &logical.Request{
-				Operation: logical.CreateOperation,
-				Path:      "config",
-				Storage:   storage,
-				Data: map[string]any{
-					"api_key_id":     "hcxmk_testkey",
-					"api_key_secret": "supersecret",
-					"api_url":        srv.URL,
-				},
-			})
-			require.NoError(t, err)
-			assert.False(t, resp.IsError(), "escape hatch should permit plaintext api_url")
-		})
-	}
+	resp, err := b.HandleRequest(ctx, &logical.Request{
+		Operation: logical.CreateOperation,
+		Path:      "config",
+		Storage:   storage,
+		Data: map[string]any{
+			"api_key_id":     "hcxmk_testkey",
+			"api_key_secret": "supersecret",
+			"api_url":        srv.URL,
+		},
+	})
+	require.NoError(t, err)
+	assert.False(t, resp.IsError(), "escape hatch should permit plaintext api_url")
 }
 
 func TestConfigWrite_RejectsMalformedURL(t *testing.T) {
@@ -417,7 +411,7 @@ func TestStoredPlaintextURLRejectedOnUse(t *testing.T) {
 	require.False(t, resp.IsError())
 
 	// Drop the escape hatch and the cached client, as a restart would.
-	t.Setenv(allowInsecureURLEnv, "")
+	b.allowInsecureURL = false
 	b.reset()
 
 	_, err = b.getClient(ctx, storage)
@@ -431,15 +425,9 @@ func TestConfigRead_WarnsOnPlaintextURL(t *testing.T) {
 	ctx := context.Background()
 	b, storage, srv := newTestBackend(t, ctx)
 
-	_, err := b.HandleRequest(ctx, &logical.Request{
-		Operation: logical.CreateOperation, Path: "config", Storage: storage,
-		Data: map[string]any{
-			"api_key_id": "hcxmk_testkey", "api_key_secret": "supersecret", "api_url": srv.URL,
-		},
-	})
-	require.NoError(t, err)
+	writeTestConfig(t, ctx, b, storage, srv.URL)
 
-	t.Setenv(allowInsecureURLEnv, "")
+	b.allowInsecureURL = false
 	resp, err := b.HandleRequest(ctx, &logical.Request{
 		Operation: logical.ReadOperation, Path: "config", Storage: storage,
 	})
@@ -1045,7 +1033,6 @@ func TestSecretRevoke_ClientUnavailable(t *testing.T) {
 // with the given status.
 func newRevokeFailureBackend(t *testing.T, ctx context.Context, deleteStatus int) (*honeycombBackend, logical.Storage) {
 	t.Helper()
-	allowPlaintextAPIURL(t)
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
@@ -1074,28 +1061,15 @@ func newRevokeFailureBackend(t *testing.T, ctx context.Context, deleteStatus int
 	}))
 	t.Cleanup(srv.Close)
 
-	config := logical.TestBackendConfig()
-	config.StorageView = &logical.InmemStorage{}
-	b := backend()
-	require.NoError(t, b.Setup(ctx, config))
+	b, storage := newBackend(t, ctx)
 
-	_, err := b.HandleRequest(ctx, &logical.Request{
-		Operation: logical.UpdateOperation,
-		Path:      "config",
-		Storage:   config.StorageView,
-		Data: map[string]any{
-			"api_key_id":     "hcxmk_testkey",
-			"api_key_secret": "supersecret",
-			"api_url":        srv.URL,
-		},
-	})
-	require.NoError(t, err)
+	writeTestConfig(t, ctx, b, storage, srv.URL)
 
 	// Speed up retries for test — getClient caches the client after config write
-	cachedClient, _ := b.getClient(ctx, config.StorageView)
+	cachedClient, _ := b.getClient(ctx, storage)
 	cachedClient.SetRetryWait(0, 0)
 
-	return b, config.StorageView
+	return b, storage
 }
 
 // TestSecretRevoke_FailureReturnsError verifies that no failure is reported as
@@ -1137,7 +1111,6 @@ func TestSecretRevoke_FailureReturnsError(t *testing.T) {
 
 func TestSecretRevoke_TransientAuthFailureReturnsError(t *testing.T) {
 	ctx := context.Background()
-	allowPlaintextAPIURL(t)
 
 	var authStatus atomic.Int32
 	authStatus.Store(http.StatusOK)
@@ -1165,16 +1138,9 @@ func TestSecretRevoke_TransientAuthFailureReturnsError(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 
-	config := logical.TestBackendConfig()
-	config.StorageView = &logical.InmemStorage{}
-	b := backend()
-	require.NoError(t, b.Setup(ctx, config))
+	b, storage := newBackend(t, ctx)
 
-	_, err := b.HandleRequest(ctx, &logical.Request{
-		Operation: logical.UpdateOperation, Path: "config", Storage: config.StorageView,
-		Data: map[string]any{"api_key_id": "hcxmk_testkey", "api_key_secret": "s", "api_url": srv.URL},
-	})
-	require.NoError(t, err)
+	writeTestConfig(t, ctx, b, storage, srv.URL)
 
 	// Simulate a cold start during a Honeycomb outage: the client has to
 	// resolve the team, and /2/auth is failing.
@@ -1185,8 +1151,8 @@ func TestSecretRevoke_TransientAuthFailureReturnsError(t *testing.T) {
 	// an error, not how long the retry schedule runs.
 	revokeCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
 	t.Cleanup(cancel)
-	_, err = b.secretKeyRevoke(revokeCtx, &logical.Request{
-		Storage: config.StorageView,
+	_, err := b.secretKeyRevoke(revokeCtx, &logical.Request{
+		Storage: storage,
 		Secret: &logical.Secret{
 			InternalData: map[string]any{
 				"key_id": "hcxik_live", "role_name": "test-role",
@@ -1209,15 +1175,9 @@ func TestSecretRevoke_TeamChangedReturnsError(t *testing.T) {
 	ctx := context.Background()
 	b, storage, srv := newTestBackend(t, ctx)
 
-	_, err := b.HandleRequest(ctx, &logical.Request{
-		Operation: logical.UpdateOperation, Path: "config", Storage: storage,
-		Data: map[string]any{
-			"api_key_id": "hcxmk_testkey", "api_key_secret": "supersecret", "api_url": srv.URL,
-		},
-	})
-	require.NoError(t, err)
+	writeTestConfig(t, ctx, b, storage, srv.URL)
 
-	_, err = b.HandleRequest(ctx, &logical.Request{
+	_, err := b.HandleRequest(ctx, &logical.Request{
 		Operation: logical.CreateOperation, Path: "roles/tester", Storage: storage,
 		Data: map[string]any{
 			"key_type": "ingest", "environment": "production", "create_datasets": true,
@@ -1269,13 +1229,7 @@ func TestSecretRevoke_ResolvesTeamOnce(t *testing.T) {
 	ctx := context.Background()
 	b, storage, srv := newTestBackend(t, ctx)
 
-	_, err := b.HandleRequest(ctx, &logical.Request{
-		Operation: logical.UpdateOperation, Path: "config", Storage: storage,
-		Data: map[string]any{
-			"api_key_id": "hcxmk_testkey", "api_key_secret": "supersecret", "api_url": srv.URL,
-		},
-	})
-	require.NoError(t, err)
+	writeTestConfig(t, ctx, b, storage, srv.URL)
 
 	// Drop the cached client, as a plugin reload or Vault restart would.
 	b.reset()
@@ -1322,7 +1276,6 @@ func repointConfigURL(t *testing.T, ctx context.Context, s logical.Storage, apiU
 
 func TestEnvCacheHit(t *testing.T) {
 	ctx := context.Background()
-	allowPlaintextAPIURL(t)
 
 	envListCalls := 0
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1358,25 +1311,10 @@ func TestEnvCacheHit(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 
-	config := logical.TestBackendConfig()
-	config.StorageView = &logical.InmemStorage{}
-	b := backend()
-	require.NoError(t, b.Setup(ctx, config))
-
-	storage := config.StorageView
+	b, storage := newBackend(t, ctx)
 
 	// Write config so getClient works
-	_, err := b.HandleRequest(ctx, &logical.Request{
-		Operation: logical.UpdateOperation,
-		Path:      "config",
-		Storage:   storage,
-		Data: map[string]any{
-			"api_key_id":     "hcxmk_testkey",
-			"api_key_secret": "supersecret",
-			"api_url":        srv.URL,
-		},
-	})
-	require.NoError(t, err)
+	writeTestConfig(t, ctx, b, storage, srv.URL)
 
 	// First resolve — should call the API
 	id, err := b.resolveEnvironmentID(ctx, storage, "production")
@@ -1393,7 +1331,6 @@ func TestEnvCacheHit(t *testing.T) {
 
 func TestEnvCacheExpiry(t *testing.T) {
 	ctx := context.Background()
-	allowPlaintextAPIURL(t)
 
 	envListCalls := 0
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1429,25 +1366,10 @@ func TestEnvCacheExpiry(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 
-	config := logical.TestBackendConfig()
-	config.StorageView = &logical.InmemStorage{}
-	b := backend()
-	require.NoError(t, b.Setup(ctx, config))
-
-	storage := config.StorageView
+	b, storage := newBackend(t, ctx)
 
 	// Write config so getClient works
-	_, err := b.HandleRequest(ctx, &logical.Request{
-		Operation: logical.UpdateOperation,
-		Path:      "config",
-		Storage:   storage,
-		Data: map[string]any{
-			"api_key_id":     "hcxmk_testkey",
-			"api_key_secret": "supersecret",
-			"api_url":        srv.URL,
-		},
-	})
-	require.NoError(t, err)
+	writeTestConfig(t, ctx, b, storage, srv.URL)
 
 	// Populate cache
 	id, err := b.resolveEnvironmentID(ctx, storage, "production")
@@ -1472,20 +1394,10 @@ func TestEnvCacheMiss(t *testing.T) {
 	b, storage, srv := newTestBackend(t, ctx)
 
 	// Write config so client can be created
-	_, err := b.HandleRequest(ctx, &logical.Request{
-		Operation: logical.UpdateOperation,
-		Path:      "config",
-		Storage:   storage,
-		Data: map[string]any{
-			"api_key_id":     "hcxmk_testkey",
-			"api_key_secret": "supersecret",
-			"api_url":        srv.URL,
-		},
-	})
-	require.NoError(t, err)
+	writeTestConfig(t, ctx, b, storage, srv.URL)
 
 	// Resolve a slug that doesn't exist
-	_, err = b.resolveEnvironmentID(ctx, storage, "nonexistent")
+	_, err := b.resolveEnvironmentID(ctx, storage, "nonexistent")
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "nonexistent")
 	assert.Contains(t, err.Error(), "not found")
@@ -1493,7 +1405,6 @@ func TestEnvCacheMiss(t *testing.T) {
 
 func TestEnvCacheMissRefreshesOnNewEnvironment(t *testing.T) {
 	ctx := context.Background()
-	allowPlaintextAPIURL(t)
 
 	envListCalls := 0
 	hasNewEnv := false
@@ -1534,25 +1445,10 @@ func TestEnvCacheMissRefreshesOnNewEnvironment(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 
-	config := logical.TestBackendConfig()
-	config.StorageView = &logical.InmemStorage{}
-	b := backend()
-	require.NoError(t, b.Setup(ctx, config))
-
-	storage := config.StorageView
+	b, storage := newBackend(t, ctx)
 
 	// Write config
-	_, err := b.HandleRequest(ctx, &logical.Request{
-		Operation: logical.UpdateOperation,
-		Path:      "config",
-		Storage:   storage,
-		Data: map[string]any{
-			"api_key_id":     "hcxmk_testkey",
-			"api_key_secret": "supersecret",
-			"api_url":        srv.URL,
-		},
-	})
-	require.NoError(t, err)
+	writeTestConfig(t, ctx, b, storage, srv.URL)
 
 	// Populate cache with production only
 	id, err := b.resolveEnvironmentID(ctx, storage, "production")
@@ -1587,17 +1483,7 @@ func TestEnvCacheResetOnConfigChange(t *testing.T) {
 	b, storage, srv := newTestBackend(t, ctx)
 
 	// Write config
-	_, err := b.HandleRequest(ctx, &logical.Request{
-		Operation: logical.UpdateOperation,
-		Path:      "config",
-		Storage:   storage,
-		Data: map[string]any{
-			"api_key_id":     "hcxmk_testkey",
-			"api_key_secret": "supersecret",
-			"api_url":        srv.URL,
-		},
-	})
-	require.NoError(t, err)
+	writeTestConfig(t, ctx, b, storage, srv.URL)
 
 	// Populate cache
 	id, err := b.resolveEnvironmentID(ctx, storage, "production")
@@ -1610,17 +1496,7 @@ func TestEnvCacheResetOnConfigChange(t *testing.T) {
 	b.lock.RUnlock()
 
 	// Rewrite config — should clear cache
-	_, err = b.HandleRequest(ctx, &logical.Request{
-		Operation: logical.UpdateOperation,
-		Path:      "config",
-		Storage:   storage,
-		Data: map[string]any{
-			"api_key_id":     "hcxmk_testkey",
-			"api_key_secret": "supersecret",
-			"api_url":        srv.URL,
-		},
-	})
-	require.NoError(t, err)
+	writeTestConfig(t, ctx, b, storage, srv.URL)
 
 	// Cache should be nil after config change
 	b.lock.RLock()
@@ -1696,7 +1572,6 @@ func TestFullLifecycle(t *testing.T) {
 // unbounded, one failing delete blocked for 89s.
 func TestSecretRevoke_IsBounded(t *testing.T) {
 	ctx := context.Background()
-	allowPlaintextAPIURL(t)
 
 	original := revokeTimeout
 	revokeTimeout = 250 * time.Millisecond
@@ -1717,19 +1592,16 @@ func TestSecretRevoke_IsBounded(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 
-	config := logical.TestBackendConfig()
-	config.StorageView = &logical.InmemStorage{}
-	b := backend()
-	require.NoError(t, b.Setup(ctx, config))
+	b, storage := newBackend(t, ctx)
 	_, err := b.HandleRequest(ctx, &logical.Request{
-		Operation: logical.UpdateOperation, Path: "config", Storage: config.StorageView,
+		Operation: logical.UpdateOperation, Path: "config", Storage: storage,
 		Data: map[string]any{"api_key_id": "k", "api_key_secret": "s", "api_url": srv.URL},
 	})
 	require.NoError(t, err)
 
 	start := time.Now()
 	_, err = b.secretKeyRevoke(ctx, &logical.Request{
-		Storage: config.StorageView,
+		Storage: storage,
 		Secret: &logical.Secret{
 			InternalData: map[string]any{
 				"key_id": "hcxik_live", "role_name": "r", "team_slug": "test-team",
@@ -1790,13 +1662,7 @@ func TestSecretRevoke_RejectsMalformedTeamSlug(t *testing.T) {
 	ctx := context.Background()
 	b, storage, srv := newTestBackend(t, ctx)
 
-	_, err := b.HandleRequest(ctx, &logical.Request{
-		Operation: logical.UpdateOperation, Path: "config", Storage: storage,
-		Data: map[string]any{
-			"api_key_id": "hcxmk_testkey", "api_key_secret": "supersecret", "api_url": srv.URL,
-		},
-	})
-	require.NoError(t, err)
+	writeTestConfig(t, ctx, b, storage, srv.URL)
 
 	// hcxik_torevoke deletes successfully, so a skipped check yields a clean
 	// revocation and the malformed value goes unnoticed.
@@ -1828,13 +1694,7 @@ func TestSecretRevoke_AbsentTeamSlugSkipsCheck(t *testing.T) {
 	ctx := context.Background()
 	b, storage, srv := newTestBackend(t, ctx)
 
-	_, err := b.HandleRequest(ctx, &logical.Request{
-		Operation: logical.UpdateOperation, Path: "config", Storage: storage,
-		Data: map[string]any{
-			"api_key_id": "hcxmk_testkey", "api_key_secret": "supersecret", "api_url": srv.URL,
-		},
-	})
-	require.NoError(t, err)
+	writeTestConfig(t, ctx, b, storage, srv.URL)
 
 	for name, internal := range map[string]map[string]any{
 		"absent": {"key_id": "hcxik_torevoke", "role_name": "test-role"},

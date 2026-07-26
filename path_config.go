@@ -29,8 +29,8 @@ const (
 // validateAPIURL checks the configured API URL, naming the field and pointing
 // at the escape hatch. The rules themselves belong to the client, which
 // enforces them at every construction site.
-func validateAPIURL(raw string) error {
-	err := client.ValidateBaseURL(raw, allowInsecureURL())
+func (b *honeycombBackend) validateAPIURL(raw string) error {
+	err := client.ValidateBaseURL(raw, b.allowInsecureURL)
 	switch {
 	case err == nil:
 		return nil
@@ -41,9 +41,10 @@ func validateAPIURL(raw string) error {
 	}
 }
 
-// allowInsecureURL reads the escape hatch. The environment is consulted here
-// and nowhere else, so the client takes the decision as a plain flag.
-func allowInsecureURL() bool {
+// insecureURLAllowedByEnv reads the escape hatch. The environment is consulted
+// here and nowhere else, once per backend, so everything downstream takes the
+// decision as a plain flag.
+func insecureURLAllowedByEnv() bool {
 	allowed, err := strconv.ParseBool(os.Getenv(allowInsecureURLEnv))
 	return err == nil && allowed
 }
@@ -127,7 +128,7 @@ func (b *honeycombBackend) pathConfigRead(ctx context.Context, req *logical.Requ
 	// Surface a stored URL that would no longer be accepted, so an operator
 	// upgrading from a version without this check can see why the mount has
 	// stopped working.
-	if err := validateAPIURL(cfg.APIURL); err != nil {
+	if err := b.validateAPIURL(cfg.APIURL); err != nil {
 		resp.Warnings = []string{fmt.Sprintf("stored api_url is no longer valid: %s", err)}
 	}
 
@@ -150,7 +151,7 @@ func (b *honeycombBackend) pathConfigWrite(ctx context.Context, req *logical.Req
 	if apiURL == "" {
 		apiURL = defaultAPIURL
 	}
-	if err := validateAPIURL(apiURL); err != nil {
+	if err := b.validateAPIURL(apiURL); err != nil {
 		return logical.ErrorResponse(err.Error()), nil
 	}
 
@@ -158,7 +159,7 @@ func (b *honeycombBackend) pathConfigWrite(ctx context.Context, req *logical.Req
 		BaseURL:          apiURL,
 		KeyID:            apiKeyID,
 		KeySecret:        apiKeySecret,
-		AllowInsecureURL: allowInsecureURL(),
+		AllowInsecureURL: b.allowInsecureURL,
 	})
 	if err != nil {
 		return logical.ErrorResponse("failed to validate credentials: %s", err), nil
