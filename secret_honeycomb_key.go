@@ -2,14 +2,11 @@ package honeycombio
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"time"
 
 	"github.com/hashicorp/vault/sdk/framework"
 	"github.com/hashicorp/vault/sdk/logical"
-
-	"github.com/jharley/vault-plugin-secrets-honeycombio/internal/client"
 )
 
 const secretKeyType = "honeycomb_key"
@@ -62,99 +59,59 @@ func (b *honeycombBackend) secretKeyRevoke(ctx context.Context, req *logical.Req
 	ctx, cancel := context.WithTimeout(ctx, revokeTimeout)
 	defer cancel()
 
+	// Every failure below returns an error rather than a warning. Returning
+	// success would drop the lease while the key is still live in Honeycomb,
+	// leaving nothing to find it by. An error keeps the lease: Vault retries,
+	// and on exhaustion records it as irrevocable, where it shows up in
+	// sys/leases?type=irrevocable and the vault.expire.num_irrevocable_leases
+	// gauge. That is the mechanism operators already have for credentials that
+	// could not be cleaned up, and `vault lease revoke -force` clears one once
+	// the key has been deleted by hand.
 	c, err := b.getClient(ctx, req.Storage)
 	if err != nil {
-		// Building a client is I/O-free when the team slug is stored, so this
-		// normally fails only on configuration problems. It can still make a
-		// network call when the slug is absent, and that is transient — it
-		// must be retried, or the lease is dropped while the key is live.
-		if isRetryableRevokeError(err) {
-			b.Logger().Error("cannot revoke API key: client unavailable, will retry", "key_id", keyID, "error", err)
-			return nil, fmt.Errorf("building client to revoke Honeycomb API key %s: %w", keyID, err)
-		}
-
-		// The configuration is gone or unusable. No amount of retrying will
-		// fix that, so warn and let the lease expire.
-		b.Logger().Error("cannot revoke API key: client unavailable, giving up", "key_id", keyID, "error", err)
-		return &logical.Response{
-			Warnings: []string{fmt.Sprintf("failed to revoke Honeycomb API key %s: %s", keyID, err)},
-		}, nil
+		b.Logger().Error("cannot revoke API key: client unavailable", "key_id", keyID, "error", err)
+		return nil, fmt.Errorf("building client to revoke Honeycomb API key %s: %w", keyID, err)
 	}
 
 	// A management key belongs to exactly one team, so a key issued under a
 	// different team cannot be deleted with the credential configured now. The
 	// request would fail, and a 404 is indistinguishable from the key already
-	// being gone — so it would be reported as a successful revocation. Detect
-	// the mismatch and say plainly that the key needs manual cleanup.
+	// being gone — so it would be reported as a successful revocation.
 	//
 	// The current team is resolved from /2/auth, so this compares the lease
 	// against ground truth and fires only when the mount has genuinely been
-	// reconfigured onto another team's management key.
-	//
-	// Leases issued before the team was recorded carry no slug; those skip the
-	// check and behave as they did before.
+	// reconfigured onto another team's management key. Leases issued before
+	// the team was recorded carry no slug and skip the check.
 	if issuedTeam, _ := req.Secret.InternalData["team_slug"].(string); issuedTeam != "" {
 		currentTeam, err := c.TeamSlug(ctx)
 		if err != nil {
-			if isRetryableRevokeError(err) {
-				return nil, fmt.Errorf("resolving team to revoke Honeycomb API key %s: %w", keyID, err)
-			}
-			return &logical.Response{
-				Warnings: []string{fmt.Sprintf("failed to revoke Honeycomb API key %s: %s", keyID, err)},
-			}, nil
+			b.Logger().Error("cannot revoke API key: team unresolved", "key_id", keyID, "error", err)
+			return nil, fmt.Errorf("resolving team to revoke Honeycomb API key %s: %w", keyID, err)
 		}
 
 		if issuedTeam != currentTeam {
+			// This provably cannot succeed on a later attempt, and wrapping
+			// logical.ErrUnrecoverable would have Vault mark the lease
+			// irrevocable at once rather than backing off six times first.
+			// No secrets engine appears to do that, so the retry schedule is
+			// left to run: it costs a few minutes and reaches the same place.
 			b.Logger().Error("cannot revoke API key: issued under a different team",
 				"key_id", keyID, "issued_team", issuedTeam, "configured_team", currentTeam)
-			return &logical.Response{
-				Warnings: []string{fmt.Sprintf(
-					"Honeycomb API key %s was issued in team %q but this mount is now configured for team %q; "+
-						"the current management key cannot revoke it and the key must be deleted manually",
-					keyID, issuedTeam, currentTeam)},
-			}, nil
+			return nil, fmt.Errorf(
+				"cannot revoke Honeycomb API key %s: it was issued in team %q but this mount is now "+
+					"configured for team %q, so the current management key cannot delete it and the "+
+					"key must be removed by hand",
+				keyID, issuedTeam, currentTeam)
 		}
 	}
 
 	b.Logger().Info("revoking API key", "key_id", keyID)
 	if err := c.DeleteAPIKey(ctx, keyID); err != nil {
-		// A transient failure must surface as an error so Vault retries the
-		// revocation. Reporting success would drop the lease while the key
-		// stays valid in Honeycomb, leaving a live credential with nothing
-		// tracking it.
-		if isRetryableRevokeError(err) {
-			b.Logger().Error("failed to revoke API key, will retry", "key_id", keyID, "error", err)
-			return nil, fmt.Errorf("deleting Honeycomb API key %s: %w", keyID, err)
-		}
-
-		// A permanent failure cannot be fixed by retrying — the management
-		// key has been rotated or lost its permissions. Warn and let the
-		// lease expire rather than retrying until Vault gives up.
-		b.Logger().Error("failed to revoke API key, giving up", "key_id", keyID, "error", err)
-		return &logical.Response{
-			Warnings: []string{fmt.Sprintf("failed to delete Honeycomb API key %s: %s", keyID, err)},
-		}, nil
+		b.Logger().Error("failed to revoke API key", "key_id", keyID, "error", err)
+		return nil, fmt.Errorf("deleting Honeycomb API key %s: %w", keyID, err)
 	}
 
 	return nil, nil
-}
-
-// isRetryableRevokeError reports whether a revocation failure is worth
-// retrying. Anything caused by the backend's own configuration is permanent;
-// transport-level failures carry no status code and are treated as transient.
-func isRetryableRevokeError(err error) bool {
-	if errors.Is(err, errNotConfigured) {
-		return false
-	}
-	var invalidCfg *invalidConfigError
-	if errors.As(err, &invalidCfg) {
-		return false
-	}
-	var apiErr *client.APIError
-	if errors.As(err, &apiErr) {
-		return apiErr.Retryable()
-	}
-	return true
 }
 
 func (b *honeycombBackend) secretKeyRenew(ctx context.Context, req *logical.Request, _ *framework.FieldData) (*logical.Response, error) {

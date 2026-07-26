@@ -1028,7 +1028,7 @@ func TestSecretRevoke_ClientUnavailable(t *testing.T) {
 	b, _, _ := newTestBackend(t, ctx)
 
 	// No config — client cannot be created
-	resp, err := b.secretKeyRevoke(ctx, &logical.Request{
+	_, err := b.secretKeyRevoke(ctx, &logical.Request{
 		Storage: &logical.InmemStorage{},
 		Secret: &logical.Secret{
 			InternalData: map[string]any{
@@ -1037,10 +1037,8 @@ func TestSecretRevoke_ClientUnavailable(t *testing.T) {
 			},
 		},
 	}, &framework.FieldData{})
-	require.NoError(t, err, "should not return error — returns warning instead")
-	require.NotNil(t, resp)
-	require.Len(t, resp.Warnings, 1)
-	assert.Contains(t, resp.Warnings[0], "hcxik_orphaned")
+	require.Error(t, err, "an unusable configuration must not be reported as a revocation")
+	assert.Contains(t, err.Error(), "hcxik_orphaned")
 }
 
 // newRevokeFailureBackend builds a backend whose DELETE requests always fail
@@ -1100,19 +1098,24 @@ func newRevokeFailureBackend(t *testing.T, ctx context.Context, deleteStatus int
 	return b, config.StorageView
 }
 
-// TestSecretRevoke_TransientFailureReturnsError verifies that a transient
-// upstream failure surfaces as an error so Vault retries revocation. Reporting
-// success would drop the lease while the key stays live in Honeycomb.
-func TestSecretRevoke_TransientFailureReturnsError(t *testing.T) {
+// TestSecretRevoke_FailureReturnsError verifies that no failure is reported as
+// a successful revocation, whatever the cause. Returning success would drop
+// the lease with the key still live in Honeycomb; an error keeps the lease, so
+// Vault retries and then records it as irrevocable where an operator can find
+// it.
+func TestSecretRevoke_FailureReturnsError(t *testing.T) {
 	ctx := context.Background()
 
 	for name, status := range map[string]int{
 		"server error":    http.StatusInternalServerError,
 		"bad gateway":     http.StatusBadGateway,
-		"rate limited":    http.StatusTooManyRequests,
-		"gateway timeout": http.StatusGatewayTimeout,
 		"unavailable":     http.StatusServiceUnavailable,
+		"gateway timeout": http.StatusGatewayTimeout,
+		"rate limited":    http.StatusTooManyRequests,
 		"request timeout": http.StatusRequestTimeout,
+		"unauthorized":    http.StatusUnauthorized,
+		"forbidden":       http.StatusForbidden,
+		"bad request":     http.StatusBadRequest,
 	} {
 		t.Run(name, func(t *testing.T) {
 			b, storage := newRevokeFailureBackend(t, ctx, status)
@@ -1126,15 +1129,12 @@ func TestSecretRevoke_TransientFailureReturnsError(t *testing.T) {
 					},
 				},
 			}, &framework.FieldData{})
-			require.Error(t, err, "transient revocation failure must be retryable")
+			require.Error(t, err, "a failed delete must not be reported as a revocation")
 			assert.Contains(t, err.Error(), "hcxik_faildelete")
 		})
 	}
 }
 
-// TestSecretRevoke_TransientAuthFailureReturnsError verifies that a transient
-// failure while resolving the team is retried too, rather than being reported
-// as a successful revocation.
 func TestSecretRevoke_TransientAuthFailureReturnsError(t *testing.T) {
 	ctx := context.Background()
 	allowPlaintextAPIURL(t)
@@ -1200,11 +1200,12 @@ func TestSecretRevoke_TransientAuthFailureReturnsError(t *testing.T) {
 		"a transient auth failure must be retried, not reported as revoked")
 }
 
-// TestSecretRevoke_WarnsWhenTeamChanged verifies that a key issued under a
-// different team is not silently reported as revoked. A management key is
-// scoped to one team, so the current credential cannot delete it — and a
-// delete attempt would 404, which DeleteAPIKey treats as success.
-func TestSecretRevoke_WarnsWhenTeamChanged(t *testing.T) {
+// TestSecretRevoke_TeamChangedReturnsError verifies that a key issued under a
+// different team is not reported as revoked, and that no delete is attempted.
+// A management key is scoped to one team, so the current credential can never
+// delete it — and the 404 that would come back is indistinguishable from the
+// key already being gone.
+func TestSecretRevoke_TeamChangedReturnsError(t *testing.T) {
 	ctx := context.Background()
 	b, storage, srv := newTestBackend(t, ctx)
 
@@ -1251,17 +1252,13 @@ func TestSecretRevoke_WarnsWhenTeamChanged(t *testing.T) {
 	repointConfigURL(t, ctx, storage, other.URL)
 	b.reset()
 
-	resp, err := b.secretKeyRevoke(ctx, &logical.Request{
+	_, err = b.secretKeyRevoke(ctx, &logical.Request{
 		Storage: storage,
 		Secret:  issued.Secret,
 	}, &framework.FieldData{})
-	require.NoError(t, err, "a mismatch is permanent, so the lease should not be retried forever")
-	require.NotNil(t, resp)
-	require.Len(t, resp.Warnings, 1)
-
-	assert.Contains(t, resp.Warnings[0], "test-team", "warning should name the issuing team")
-	assert.Contains(t, resp.Warnings[0], "a-different-team", "warning should name the configured team")
-	assert.Contains(t, resp.Warnings[0], "manually", "warning should say the key needs manual cleanup")
+	require.Error(t, err, "a key in another team must not be reported as revoked")
+	assert.Contains(t, err.Error(), "test-team", "should name the issuing team")
+	assert.Contains(t, err.Error(), "a-different-team", "should name the configured team")
 	assert.Zero(t, deleteCalls.Load(),
 		"must not attempt a delete the current management key cannot perform")
 }
@@ -1321,37 +1318,6 @@ func repointConfigURL(t *testing.T, ctx context.Context, s logical.Storage, apiU
 	entry, err := logical.StorageEntryJSON(configStoragePath, cfg)
 	require.NoError(t, err)
 	require.NoError(t, s.Put(ctx, entry))
-}
-
-// TestSecretRevoke_PermanentFailureWarns verifies that an unrecoverable
-// failure warns and lets the lease expire, rather than making Vault retry a
-// revocation that can never succeed.
-func TestSecretRevoke_PermanentFailureWarns(t *testing.T) {
-	ctx := context.Background()
-
-	for name, status := range map[string]int{
-		"unauthorized": http.StatusUnauthorized,
-		"forbidden":    http.StatusForbidden,
-		"bad request":  http.StatusBadRequest,
-	} {
-		t.Run(name, func(t *testing.T) {
-			b, storage := newRevokeFailureBackend(t, ctx, status)
-
-			resp, err := b.secretKeyRevoke(ctx, &logical.Request{
-				Storage: storage,
-				Secret: &logical.Secret{
-					InternalData: map[string]any{
-						"key_id":    "hcxik_faildelete",
-						"role_name": "test-role",
-					},
-				},
-			}, &framework.FieldData{})
-			require.NoError(t, err, "permanent failure should not be retried forever")
-			require.NotNil(t, resp)
-			require.Len(t, resp.Warnings, 1)
-			assert.Contains(t, resp.Warnings[0], "hcxik_faildelete")
-		})
-	}
 }
 
 func TestEnvCacheHit(t *testing.T) {

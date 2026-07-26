@@ -51,14 +51,6 @@ func validateAPIURL(raw string) error {
 	}
 }
 
-// invalidConfigError marks a stored configuration that cannot be used as-is.
-// It is permanent until an operator rewrites the config, so callers must not
-// retry against it.
-type invalidConfigError struct{ err error }
-
-func (e *invalidConfigError) Error() string { return e.err.Error() }
-func (e *invalidConfigError) Unwrap() error { return e.err }
-
 func allowInsecureURL() bool {
 	allowed, err := strconv.ParseBool(os.Getenv(allowInsecureURLEnv))
 	return err == nil && allowed

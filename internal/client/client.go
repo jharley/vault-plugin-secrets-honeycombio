@@ -279,18 +279,6 @@ func (e *APIError) Error() string {
 	return fmt.Sprintf("status %d: %s", e.StatusCode, e.Detail)
 }
 
-// Retryable reports whether the failure may succeed on a later attempt.
-// Server-side failures, timeouts and rate limiting are transient; other 4xx
-// responses indicate a request that will fail identically every time.
-func (e *APIError) Retryable() bool {
-	switch e.StatusCode {
-	case http.StatusRequestTimeout, http.StatusTooManyRequests:
-		return true
-	default:
-		return e.StatusCode >= 500
-	}
-}
-
 // apiError parses a JSON:API error response and returns an *APIError.
 // Falls back to the raw body if the response is not valid JSON:API.
 func apiError(resp *http.Response) error {
